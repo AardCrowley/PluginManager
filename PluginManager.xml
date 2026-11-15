@@ -1,0 +1,2631 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+<plugin
+   name="Plugin_Manager"
+   author="Crowley"
+   id="90c72abc87538b973eba3e97"
+   language="Lua"
+   purpose="Install, update, reload, enable, disable and remove plugins from one place"
+   save_state="y"
+   date_written="2026-11-14 12:00:00"
+   requires="5.07"
+   version="2.7"
+   sequence="-50"
+   >
+<description trim="y">
+Plugin Manager
+  pm                          open or close the manager window
+  pm list [crowley|stock|other|store|links|updates|all]    list plugins as text (numbers work in every command)
+  pm check                    read the manifest and the repositories, mark plugins that have a newer version
+  pm force NAME|NUMBER        replace an installed plugin with a look-alike offered by a repository (a fork): backs up the current one, takes it out, installs the repository's
+  pm update NAME|NUMBER|all   download the newer version, keep the old file as a backup, reload it
+  pm install NAME|NUMBER      download a plugin that is offered but not loaded, and load it
+  pm reload|unload|enable|disable NAME|NUMBER
+  pm add [FILE]               add a plugin file you downloaded yourself (no FILE: pick one); it is copied in and loaded
+  pm load FILE                load a plugin file where it is (a path, or a file name inside the plugins folder)
+  pm remove NAME|NUMBER       uninstall a plugin from MUSHclient (nothing is deleted: its file and its saved data stay)
+  pm rollback NAME|NUMBER     put back the file the last update replaced
+  pm info NAME|NUMBER         details, file, source, repository link
+  pm open NAME|NUMBER         open the repository link in your browser
+  pm aliases NAME|NUMBER      a window with the aliases the plugin defines (pm triggers: its triggers); Copy puts the list on the clipboard
+  pm state NAME|NUMBER        open the plugin's saved-state file in your editor (the program your system uses to edit .xml files)
+  pm source                   list the places plugins are offered from
+  pm source add URL           add a GitHub repository (https://github.com/OWNER/REPO), a manifest (.json) or a plugin file (.xml).
+                              A GitHub user or organization (https://github.com/NAME) opens a checklist of its repositories
+  pm source scan URL          for a GitHub user or organization: look through its repositories and add the ones that contain plugins
+  pm source remove N|URL|OWNER  stop listing a source, or every source of an owner (plugins already installed stay)
+  pm font [NAME [SIZE]|reset] show or change the window font
+  pm save                     save the world file, so what is loaded now is loaded next time
+  pm manifest [URL|reset]     show or set the address of the main manifest (https only)
+  pm dir [FOLDER]             show or set the folder new plugins are installed into
+  pm auto on|off              check about once a day and say when there are updates (never installs anything)
+  pm help                     this list
+NAME can be part of a name. Nothing is ever installed or updated without a command or a button click.
+</description>
+</plugin>
+
+<aliases>
+  <alias match="^pm(?:\s+(.*))?$" enabled="y" regexp="y" script="pm_command" sequence="100" ignore_case="y"/>
+</aliases>
+
+<script>
+<![CDATA[
+local SELF = GetPluginID()
+local WIN = "PluginManagerWin"
+
+local function say(msg) ColourNote("silver", "", "[Plugins] ", "white", "", msg) end
+local function var(name, default) local v = GetVariable(name); if v == nil or v == "" then return default end; return v end
+local function trim(s) return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+local function rc_text(rc) return (error_desc and error_desc[rc]) or ("error " .. tostring(rc)) end
+
+local H = {}                              -- small helpers (kept in a table: a Lua chunk may only have 200 local variables)
+local json_ok, json = pcall(require, "json")
+local async_ok, async = pcall(require, "async")
+
+---------------------------------------------------------------------------
+-- Files and paths
+---------------------------------------------------------------------------
+local function basename(p) return (tostring(p):match("([^\\/]*)$")) end
+local function dirname(p) return (tostring(p):match("^(.*[\\/])") or "") end
+local function exists(p) local h = io.open(p, "rb"); if h then h:close(); return true end; return false end
+local function readfile(p) local h = io.open(p, "rb"); if not h then return nil end; local t = h:read("*a"); h:close(); return t end
+local function writefile(p, data)
+  local h, err = io.open(p, "wb"); if not h then return false, err end
+  local ok, werr = h:write(data)
+  local cok, cerr = h:close()
+  if not ok or not cok then os.remove(p); return false, werr or cerr end
+  return true
+end
+local function install_dir()
+  local d = var("dir", "")
+  if d == "" then d = dirname(GetPluginInfo(SELF, 6) or "") end
+  if d ~= "" and not d:match("[\\/]$") then d = d .. "\\" end
+  return d
+end
+-- MUSHclient may be strict about the case of a plugin id (ids are 24 hex characters and some are written with capital letters): calls use the id as the client lists it
+function H.rid(id)
+  local l = tostring(id):lower()
+  for _, x in ipairs(GetPluginList() or {}) do if x:lower() == l then return x end end
+  return id
+end
+function H.is_installed(id)
+  local l = tostring(id):lower()
+  for _, x in ipairs(GetPluginList() or {}) do if x:lower() == l then return true end end
+  return false
+end
+function H.sep_in(path) return path:find("\\", 1, true) and "\\" or (path:find("/", 1, true) and "/" or "\\") end
+function H.join_rel(dir, rel)                          -- dir ends with a separator; rel uses /
+  return dir .. rel:gsub("/", (H.sep_in(dir)))
+end
+function H.dir_ok(path)                                -- can files be written in this folder?
+  local probe = path .. "pm_probe.tmp"
+  local h = io.open(probe, "wb")
+  if h then h:close(); os.remove(probe); return true end
+  return false
+end
+function H.make_dir(path)                              -- path ends with a separator: create it (and the folders above it) if it is not there; true when it can be written to
+  if H.dir_ok(path) then return true end
+  local l = lfs
+  if not l then local ok, m = pcall(require, "lfs"); if ok then l = m end end
+  if type(l) == "table" and l.mkdir then
+    for i in path:gmatch("()[\\/]") do if i > 1 then pcall(l.mkdir, path:sub(1, i - 1)) end end
+    if H.dir_ok(path) then return true end
+  end
+  if utils and utils.shellexecute then                     -- the command runs on its own: the caller looks again later
+    local winpath = package.config:sub(1, 1) == "\\" and path:gsub("/", "\\") or path
+    pcall(utils.shellexecute, "cmd", '/C mkdir "' .. winpath .. '"', "", "open", 0)
+  end
+  return H.dir_ok(path)
+end
+local function backup_name(path)                      -- next to the file, the way the other .bak_YYYYMMDD files are: name.xml.bak_20261114
+  local base = path .. ".bak_" .. os.date("%Y%m%d")
+  if not exists(base) then return base end
+  local n = 2
+  while n < 500 and exists(base .. "_" .. n) do n = n + 1 end
+  return base .. "_" .. n
+end
+
+---------------------------------------------------------------------------
+-- The plugins that come with the AardMUSHclient package (listed in its Aardwolf.mcl)
+---------------------------------------------------------------------------
+local STOCK = {}
+for f in ([[aard_requirements.xml aard_text_substitution.xml aard_prompt_fixer.xml aard_chat_echo.xml aard_channels_fiendish.xml
+  aard_soundpack.xml aard_gmcp_handler.xml aard_miniwindow_z_order_monitor.xml aard_layout.xml aard_statmon_gmcp.xml
+  aard_group_monitor_gmcp.xml aard_health_bars_gmcp.xml aard_copy_colour_codes.xml aard_ascii_map.xml aard_repaint_buffer.xml
+  aard_new_connection.xml aard_inventory_serials.xml hyperlink_url2.xml aard_gmcp_mapper.xml aard_package_update_checker.xml
+  aard_help.xml aard_keyboard_lockout.xml aard_splitscreen_scrollback.xml aard_vital_shortcuts.xml aard_theme_controller.xml
+  aard_ingame_help_window.xml automatic_backup.xml]]):gmatch("%S+") do STOCK[f] = true end
+
+---------------------------------------------------------------------------
+-- Manifest: a JSON file on your server
+--   { "manifest": 1, "base": "https://host/path/",
+--     "plugins": [ { "id", "name", "version", "file", "url", "sha256", "purpose", "repo", "extras": [ {"file","url","sha256"} ] } ],
+--     "outside": [ { "name", "repo", "id" (optional), "note" } ] }
+---------------------------------------------------------------------------
+local OWNER = "Crowley"                    -- the tab and the group of the plugins that come from the main manifest (and of plugins whose author is OWNER)
+local DEFAULT_MANIFEST = "https://github.com/AardCrowley/PluginManager/blob/main/manifest.json"
+local sources = {}                         -- where plugins are offered from: [1] is the main manifest, the rest are repositories the player added
+                                           --   { url, kind = "manifest" | "repo" | "file", def = true (main one), data = parsed manifest or nil, err = why the last read failed }
+local checked_at = tonumber(var("manifest_at", "0")) or 0
+local items = {}                        -- every row (rebuilt by refresh)
+local shown = {}                           -- the rows the window drew last: its buttons count in this list
+local shown_indent = {}                    -- row -> how far the Store tab indents it (under an owner, under a repository)
+local listed = {}                          -- the keys of the rows `pm list` printed last: the numbers in commands and links count in this list
+local selected, sel_key = nil, nil         -- the row picked in the window, and what identifies it (rows are rebuilt on every refresh)
+local function key_of(it) if it.header == "owner" then return "owner:" .. it.key elseif it.header then return "src:" .. it.src.url end; return it.id or ("name:" .. it.name) end
+local last_err = nil                       -- why the last manifest check failed
+local busy = nil                           -- a short description of the network job running, if any
+
+local function vernum(v) return tonumber(v) end
+
+-- a file name that may be written into the plugin folder: letters, digits, _ - . and spaces; no paths, no drive letters, no ":stream"
+H.RESERVED = {}                          -- Windows device names: "nul.lua" is the NUL device, whatever the extension
+for w in ("con prn aux nul com1 com2 com3 com4 com5 com6 com7 com8 com9 lpt1 lpt2 lpt3 lpt4 lpt5 lpt6 lpt7 lpt8 lpt9"):gmatch("%S+") do H.RESERVED[w] = true end
+local function safe_name(n)
+  return type(n) == "string" and n ~= "" and #n <= 100 and n:match("^[%w_][%w_%-%. ]*$") ~= nil and not n:match("[%. ]$") and not H.RESERVED[n:lower():match("^([^.]*)")]
+end
+
+-- Extra files a plugin needs (its .lua modules, data, sounds ...) may sit in sub-folders of the plugin's own folder: "lua/util.lua", "sounds/hit.wav".
+do
+local DENY_EXT = {}
+for e in ("exe dll bat cmd com scr ps1 vbs vbe js jse wsf wsh msi lnk reg jar cpl hta pif xml mcl"):gmatch("%S+") do DENY_EXT[e] = true end     -- programs and plugin/world files are never extras
+function H.ext_of(name) return (name:lower():match("%.([%w]+)$")) or "" end
+function H.rel_ok(rel)                                 -- a relative path with / separators: plain names only, at most 4 deep, nothing executable
+  if type(rel) ~= "string" or #rel > 200 then return false end
+  local n, last = 0, nil
+  for seg in (rel .. "/"):gmatch("([^/]*)/") do
+    n = n + 1; last = seg
+    if not safe_name(seg) or seg:lower():match("%.pm_new$") or seg:lower():find(".bak_", 1, true) then return false end
+  end
+  return n >= 1 and n <= 4 and not DENY_EXT[H.ext_of(last)] and not last:lower():match("^plugin_manager_")
+end
+-- files that belong to a repository rather than to a plugin: README, LICENSE, git.txt, .gitignore ... (a changelog.lua is code, a changelog.md is not)
+local DOC_STEMS, DOC_EXT = {}, { [""] = true, txt = true, md = true, markdown = true, rst = true, html = true }
+for w in ("readme license licence copying notice changelog changes contributing credit credits authors code_of_conduct security history"):gmatch("%S+") do DOC_STEMS[w] = true end
+function H.denied_file(base) return DENY_EXT[H.ext_of(base)] or false end
+function H.is_standard_file(base)
+  local b = base:lower()
+  if b:sub(1, 1) == "." or b == "git.txt" then return true end
+  local e = H.ext_of(b)
+  if e == "md" or e == "markdown" then return true end
+  return DOC_STEMS[(b:gsub("%..*$", ""))] and DOC_EXT[e] or false
+end
+end
+
+local function normalize_manifest(t)
+  if type(t) ~= "table" or type(t.plugins) ~= "table" then return nil, "the manifest has no plugins list" end
+  local out = { base = type(t.base) == "string" and t.base or nil, name = type(t.name) == "string" and t.name or nil, plugins = {}, outside = {} }
+  local seen = {}
+  for _, m in ipairs(t.plugins) do
+    if type(m) == "table" and type(m.id) == "string" and m.id:match("^%x+$") and #m.id == 24 and type(m.name) == "string" and type(m.url) == "string"
+       and (type(m.version) == "string" or type(m.version) == "number") and tostring(m.version):match("^%d+%.?%d*$") and not seen[m.id:lower()] then
+      m.id = m.id:lower(); m.version = tostring(m.version)
+      m.name = (m.name:gsub("%c", " "):sub(1, 80))                       -- names end up in dialogs: no line breaks, no essays
+      seen[m.id] = true
+      local file = m.file
+      if type(file) ~= "string" then file = (m.url:match("([^/\\?#]+)$") or "") end
+      if safe_name(file) and file:lower():match("%.xml$") and not file:lower():match("^plugin_manager_") then
+        m.file = file
+        if type(m.sha256) ~= "string" then m.sha256 = nil end
+        for _, k in ipairs({ "purpose", "repo", "changes", "author" }) do if type(m[k]) ~= "string" then m[k] = nil end end
+        if type(m.dir) ~= "string" or not safe_name(m.dir) or m.dir:lower():match("^plugin_manager_") then m.dir = nil end      -- the folder a new install goes into (plugins with extra files)
+        local extras, names = {}, { [file:lower()] = true }
+        if type(m.extras) == "table" then
+          for _, x in ipairs(m.extras) do
+            if type(x) == "table" and H.rel_ok(x.file) and type(x.url) == "string" and type(x.sha256) == "string" and #extras < 80 and not names[x.file:lower()] then
+              names[x.file:lower()] = true
+              extras[#extras + 1] = { file = x.file, url = x.url, sha256 = x.sha256 }
+            end
+          end
+        end
+        m.extras = extras
+        out.plugins[#out.plugins + 1] = m
+      end
+    end
+  end
+  if type(t.outside) == "table" then
+    for _, o in ipairs(t.outside) do
+      if type(o) == "table" and type(o.name) == "string" then
+        if type(o.id) ~= "string" then o.id = nil else o.id = o.id:lower() end
+        for _, k in ipairs({ "repo", "note", "author" }) do if type(o[k]) ~= "string" then o[k] = nil end end
+        out.outside[#out.outside + 1] = o
+      end
+    end
+  end
+  return out
+end
+
+local function parse_manifest(text)
+  if not json_ok then return nil, "the json module is not available" end
+  local ok, t = pcall(json.decode, text)
+  if not ok or type(t) ~= "table" then return nil, "the manifest is not valid JSON" end
+  return normalize_manifest(t)
+end
+
+local function plugin_dir() return dirname(GetPluginInfo(SELF, 6) or "") end
+
+-- the places plugins are offered from. Anything but the main manifest is a player's choice: a GitHub repository (the manager looks
+-- for plugin files in it), a manifest (.json) or a single plugin file (.xml) at an https address.
+local function normalize_source(u)
+  u = trim(u)
+  local o, r, ref, path = u:match("^https://github%.com/([%w_%-%.]+)/([%w_%-%.]+)/blob/([^/]+)/(.+)$")      -- a link to a file in a repository: use the raw file
+  if o then return "https://raw.githubusercontent.com/" .. o .. "/" .. r .. "/" .. ref .. "/" .. path end
+  return u
+end
+H.OWNER_RESERVED = { orgs = true, users = true, topics = true, features = true, about = true, pricing = true, login = true, settings = true, marketplace = true,
+                         explore = true, sponsors = true, collections = true, trending = true, search = true, notifications = true, new = true, issues = true, pulls = true }
+local function owner_of(u)                                -- the name in a link to a GitHub user or organization (not to one repository), else nil
+  u = trim(u):gsub("[?#].*$", "")
+  u = u:gsub("/+$", "")
+  local name = u:match("^https://github%.com/orgs/([%w_%-]+)/?[%w_%-/]*$") or u:match("^https://github%.com/([%w_%-]+)$")
+  if name and not H.OWNER_RESERVED[name:lower()] then return name end
+  return nil
+end
+local function canon_url(u)                              -- the same repository written in different ways counts once
+  u = u:lower():gsub("/+$", ""):gsub("%.git$", "")
+  return u
+end
+local function kind_of(u)
+  if owner_of(u) then return nil end
+  if u:match("^https://github%.com/[%w_%-%.]+/[%w_%-%.]+/?$") and not H.OWNER_RESERVED[(u:match("^https://github%.com/([%w_%-%.]+)") or ""):lower()] then return "repo" end   -- (a repository may be called x.json)
+  local low = u:lower():gsub("[?#].*$", "")
+  local host, tail = u:match("^https://([%w%-%.]+)(.*)$")
+  if not host or (tail ~= "" and not tail:match("^[/?#]")) or tail:find("[^/%w%-%._~%%:!$&'()*+,;=?#]") then return nil end
+  if low:match("%.json$") then return "manifest" end
+  if low:match("%.xml$") then return "file" end
+  if u:match("^https://github%.com/[%w_%-%.]+/[%w_%-%.]+") and not H.OWNER_RESERVED[(u:match("^https://github%.com/([%w_%-%.]+)") or ""):lower()] then return "repo" end
+  return nil
+end
+local function repo_parts(url)                              -- owner, repo, branch (HEAD = the default one), folder inside the repository
+  local o, r, rest = url:match("^https://github%.com/([%w_%-%.]+)/([%w_%-%.]+)(.*)$")
+  if not o then return nil end
+  r = r:gsub("%.git$", "")
+  local ref, sub = "HEAD", ""
+  local b, p = rest:match("^/tree/([^/]+)/?(.*)$")
+  if b then ref = b; sub = (p:gsub("/+$", "")) end
+  return o, r, ref, sub
+end
+local function raw_url(o, r, ref, path)
+  return "https://raw.githubusercontent.com/" .. o .. "/" .. r .. "/" .. ref .. "/" .. (path:gsub("[^%w_%-%./]", function(c) return string.format("%%%02X", c:byte()) end))
+end
+local function src_label(src)
+  if src.def then return OWNER end
+  local o, r = src.url:match("^https://github%.com/([%w_%-%.]+)/([%w_%-%.]+)")
+  if not o then o, r = src.url:match("^https://raw%.githubusercontent%.com/([%w_%-%.]+)/([%w_%-%.]+)/") end
+  if o then return o .. "/" .. (r:gsub("%.git$", "")) end
+  return (src.url:gsub("^https://", ""))
+end
+local function urlkey(u)                                    -- a short, stable name for a cache file
+  if utils and utils.sha256 then
+    local d = utils.sha256(u)
+    if #d == 32 then d = utils.tohex(d) end
+    return d:lower():sub(1, 16)
+  end
+  local h = 5381
+  for i = 1, #u do h = (h * 33 + u:byte(i)) % 4294967296 end
+  return string.format("%08x", h)
+end
+-- What was read from the sources is kept in ONE file next to the manager, plugin_manager_cache.json ({ "sources": { address: manifest } }),
+-- so the plugins folder does not fill up with a file per source.
+local cache = nil
+local function cache_path() return plugin_dir() .. "plugin_manager_cache.json" end
+local function cache_save()
+  if not (json_ok and json.encode) then return end
+  if next(cache) == nil then os.remove(cache_path()); return end
+  local ok, text = pcall(json.encode, { cache = 1, sources = cache })
+  if ok and type(text) == "string" then writefile(cache_path(), text) end
+end
+local function migrate_old_cache_files()                    -- versions before 2.5 wrote plugin_manager_manifest.json and one plugin_manager_src_*.json per source
+  local dir = plugin_dir()
+  local function take(path, url)
+    local text = readfile(path)
+    if text then
+      if url and url ~= "" and not cache[url] then local m = parse_manifest(text); if m then cache[url] = m end end
+      os.remove(path)
+    end
+  end
+  take(dir .. "plugin_manager_manifest.json", var("manifest", DEFAULT_MANIFEST))
+  for line in (var("sources", "") .. "\n"):gmatch("(.-)\n") do
+    line = trim(line)
+    if line ~= "" then take(dir .. "plugin_manager_src_" .. urlkey(line) .. ".json", line) end
+  end
+  if utils and utils.readdir then                            -- any that are left (a source that is no longer listed)
+    local ok, list = pcall(utils.readdir, dir .. "plugin_manager_src_*.json")
+    if ok and type(list) == "table" then for name in pairs(list) do if tostring(name):match("^plugin_manager_src_%x+%.json$") then os.remove(dir .. name) end end end
+  end
+end
+local function cache_load()
+  if cache then return cache end
+  cache = {}
+  local text = readfile(cache_path())
+  if text and json_ok then
+    local ok, t = pcall(json.decode, text)
+    if ok and type(t) == "table" and type(t.sources) == "table" then
+      for url, d in pairs(t.sources) do local m = normalize_manifest(d); if m then cache[url] = m end end
+    end
+  end
+  migrate_old_cache_files()
+  cache_save()
+  return cache
+end
+local function save_cache(src, m) cache_load()[src.url] = m; cache_save() end
+local function drop_cache(src) if cache_load()[src.url] then cache[src.url] = nil; cache_save() end end
+
+local function build_sources()                              -- from the saved settings; what was read from a source that stays is kept
+  local old = {}
+  for _, s in ipairs(sources) do old[s.url] = s end
+  sources = {}
+  local function add(url, kind, def)
+    local o = old[url]
+    local s = { url = url, kind = kind, def = def or nil }
+    if o then s.data, s.err = o.data, o.err
+    else
+      s.data = cache_load()[url]
+    end
+    sources[#sources + 1] = s
+  end
+  local d = var("manifest", DEFAULT_MANIFEST)
+  if d ~= "" then add(d, "manifest", true) end
+  for line in (var("sources", "") .. "\n"):gmatch("(.-)\n") do
+    line = trim(line)
+    local k = line ~= "" and line ~= d and kind_of(line)
+    if k then add(line, k) end
+  end
+end
+local function save_sources()
+  local t = {}
+  for _, s in ipairs(sources) do if not s.def then t[#t + 1] = s.url end end
+  SetVariable("sources", table.concat(t, "\n"))
+end
+local function main_data() return sources[1] and sources[1].def and sources[1].data or nil end
+
+local function src_base(src)                                -- what a relative address in that source's manifest is relative to
+  local b = src.data and src.data.base
+  if b and b ~= "" then return b end
+  if src.kind == "repo" then
+    local o, r, ref, sub = repo_parts(src.url)
+    if o then return raw_url(o, r, ref, sub ~= "" and (sub .. "/") or "") end
+  end
+  return (src.url:gsub("[?#].*$", ""):gsub("[^/]*$", ""))
+end
+local function resolve_url(u, src)
+  if u:match("^https?://") then return u end
+  local base = src and src_base(src) or ""
+  if base ~= "" and not base:match("/$") then base = base .. "/" end
+  return base .. u
+end
+
+---------------------------------------------------------------------------
+-- Rows
+---------------------------------------------------------------------------
+local ORDER = { mine = 1, stock = 2, other = 3, store = 4, outside = 5 }
+local function group_of(it)
+  if it.src and it.src.def then return "mine" end
+  if it.src then return it.loaded and "other" or "store" end         -- offered by a repository the player added: never labeled Crowley or Stock
+  local file = (it.file or ""):lower()
+  if STOCK[basename(file)] then return "stock" end
+  if it.loaded and (it.author or ""):lower() == OWNER:lower() then return "mine" end
+  if it.src then return it.loaded and "other" or "store" end
+  return "other"
+end
+
+local function refresh()
+  items = {}
+  local byid = {}
+  for _, id in ipairs(GetPluginList() or {}) do
+    local lid = id:lower()
+    if not byid[lid] then
+      local it = { id = lid, name = GetPluginInfo(id, 1) or id, ver = GetPluginInfo(id, 19), enabled = GetPluginInfo(id, 17) and true or false,
+                   file = GetPluginInfo(id, 6), author = GetPluginInfo(id, 2), purpose = GetPluginInfo(id, 8), loaded = true, self = (lid == SELF:lower()) }
+      byid[lid] = it
+      items[#items + 1] = it
+    end
+  end
+  for _, src in ipairs(sources) do                       -- the main manifest comes first: a plugin it offers is "Crowley's", whoever else lists it
+    local d = src.data
+    if d then
+      for _, m in ipairs(d.plugins) do
+        local it = byid[m.id]
+        -- a repository cannot take over the update channel of the manager itself, a package plugin, or one by OWNER
+        local guarded = not src.def and it and it.loaded and (it.self or STOCK[basename((it.file or ""):lower())] or (it.author or ""):lower() == OWNER:lower())
+        if not guarded then
+          if not it then
+            it = { id = m.id, name = m.name, loaded = false }
+            byid[m.id] = it
+            items[#items + 1] = it
+          end
+          if not it.m then it.m, it.src = m, src end
+        end
+      end
+      for _, o in ipairs(d.outside) do
+        local it = o.id and byid[o.id]
+        if it then it.o = it.o or o else items[#items + 1] = { name = o.name, loaded = false, o = o, outside = true } end
+      end
+    end
+  end
+  for _, it in ipairs(items) do
+    if it.m then
+      local mv, iv = vernum(it.m.version), vernum(it.ver)
+      it.update = (it.loaded and mv and iv and mv > iv) and true or false
+      it.ahead = (it.loaded and mv and iv and iv > mv) and true or false
+    end
+    it.group = it.outside and "other" or group_of(it)          -- link-only entries (the manifest's "outside" list) sit under Other with the rest
+  end
+  table.sort(items, function(a, b)
+    if a.group ~= b.group then return ORDER[a.group] < ORDER[b.group] end
+    return a.name:lower() < b.name:lower()
+  end)
+  selected = nil
+  if sel_key then for _, it in ipairs(items) do if key_of(it) == sel_key then selected = it end end end
+end
+
+local function live(key)                                      -- the current row for a key (rows are rebuilt on every refresh)
+  for _, it in ipairs(items) do if key_of(it) == key then return it end end
+end
+
+local function updates_count()
+  local n = 0
+  for _, it in ipairs(items) do if it.update then n = n + 1 end end
+  return n
+end
+
+local FILTERS = { all = true, mine = true, crowley = true, stock = true, other = true, store = true, links = true, updates = true }
+local function filter_rows(which)
+  if which == "crowley" then which = "mine" end
+  local out = {}
+  for _, it in ipairs(items) do
+    if which == "all" or which == it.group or (which == "updates" and it.update) or (which == "links" and it.outside) or (which == "store" and it.src and not it.src.def) then out[#out + 1] = it end
+  end
+  return out
+end
+
+-- the owner a source belongs to: the GitHub user or organization, else the host it is served from
+local function owner_key(src)
+  local o = src.url:match("^https://github%.com/([%w_%-]+)/") or src.url:match("^https://raw%.githubusercontent%.com/([%w_%-]+)/")
+  return o or src.url:match("^https://([^/]+)") or "other"
+end
+local function repo_part(src, owner)                       -- a source's name without the owner in front of it
+  local label = src_label(src)
+  local pre = owner:lower() .. "/"
+  if label:lower():sub(1, #pre) == pre then return label:sub(#pre + 1) end
+  return label
+end
+-- what the window lists. The Store tab is two accordions: one header per owner (only the picked owner is open), and inside an owner that has several
+-- repositories one header per repository (only the picked one is open). An owner with a single source shows its plugins straight under its header.
+local function build_shown(tab)
+  local rows = filter_rows(tab)
+  for k in pairs(shown_indent) do shown_indent[k] = nil end
+  if tab ~= "store" then return rows end
+  local order, groups = {}, {}
+  for _, src in ipairs(sources) do
+    if not src.def then
+      local k = owner_key(src)
+      local g = groups[k:lower()]
+      if not g then g = { key = k:lower(), name = k, srcs = {} }; groups[k:lower()] = g; order[#order + 1] = g end
+      g.srcs[#g.srcs + 1] = src
+    end
+  end
+  local want_owner, want_repo = var("store_owner", ""), var("store_open", "")
+  local openkey
+  if want_owner ~= "#none" then
+    for _, g in ipairs(order) do if g.key == want_owner then openkey = g.key end end
+    openkey = openkey or (order[1] and order[1].key)
+  end
+  local out = {}
+  for _, g in ipairs(order) do
+    local per, nplug, nups, nerr, firsterr = {}, 0, 0, 0, nil
+    for _, src in ipairs(g.srcs) do
+      local mine = {}
+      for _, it in ipairs(rows) do if it.src == src then mine[#mine + 1] = it; nplug = nplug + 1; if it.update then nups = nups + 1 end end end
+      per[src] = mine
+      if src.err then nerr = nerr + 1; firsterr = firsterr or src.err end
+    end
+    local isopen = (openkey == g.key)
+    out[#out + 1] = { header = "owner", key = g.key, name = g.name, open = isopen, repos = #g.srcs, count = nplug, ups = nups, nerr = nerr, err = firsterr, src = g.srcs[1] }
+    if isopen then
+      if #g.srcs == 1 then
+        for _, it in ipairs(per[g.srcs[1]]) do out[#out + 1] = it; shown_indent[it] = 16 end
+      else
+        local ropen
+        if want_repo ~= "none" then
+          for _, src in ipairs(g.srcs) do if src.url == want_repo then ropen = src end end
+          ropen = ropen or g.srcs[1]
+        end
+        for _, src in ipairs(g.srcs) do
+          local mine, ups = per[src], 0
+          for _, it in ipairs(mine) do if it.update then ups = ups + 1 end end
+          local h = { header = "repo", src = src, name = repo_part(src, g.name), open = (ropen == src), count = #mine, ups = ups, err = src.err }
+          out[#out + 1] = h; shown_indent[h] = 16
+          if h.open then for _, it in ipairs(mine) do out[#out + 1] = it; shown_indent[it] = 32 end end
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- NAME or NUMBER (a number from the last list or the window) -> a row
+local function find(arg)
+  arg = trim(arg)
+  if arg == "" then return nil, "Which plugin? Give a name or a number (pm list shows both)." end
+  local n = tonumber(arg)
+  if n and listed[n] then
+    local it = live(listed[n])
+    if it then return it end
+    return nil, "That row has changed since the list was printed: run  pm list  again."
+  end
+  if n then return nil, "There is no number " .. arg .. " in the last list (pm list prints the numbers)." end
+  if arg:match("^%x+$") and #arg == 24 then for _, it in ipairs(items) do if it.id == arg:lower() then return it end end end
+  local low, exact, part = arg:lower(), nil, {}
+  for _, it in ipairs(items) do
+    local nm = it.name:lower()
+    if nm == low then exact = it; break end
+    if nm:find(low, 1, true) then part[#part + 1] = it end
+  end
+  if exact then return exact end
+  if #part == 1 then return part[1] end
+  if #part == 0 then return nil, 'No plugin matches "' .. arg .. '".' end
+  local names = {}
+  for i = 1, math.min(#part, 6) do names[#names + 1] = part[i].name end
+  return nil, '"' .. arg .. '" matches several: ' .. table.concat(names, ", ") .. (#part > 6 and ", ..." or "")
+end
+
+---------------------------------------------------------------------------
+-- Window (defined further down); the text commands call this after a change
+---------------------------------------------------------------------------
+local redraw_window = function() end
+
+local function after_change()
+  refresh()
+  redraw_window()
+end
+
+---------------------------------------------------------------------------
+-- Plain actions
+---------------------------------------------------------------------------
+-- a plugin cannot reload itself directly (MUSHclient refuses): ask the world's script engine to do it, the way the Aardwolf plugins do
+local function reload_self(id)
+  local prefix = GetAlphaOption("script_prefix")
+  if prefix == "" then prefix = "\\\\\\"; SetAlphaOption("script_prefix", prefix) end
+  Execute(prefix .. "DoAfterSpecial(0.1, \"ReloadPlugin('" .. H.rid(id) .. "')\", sendto.script)")
+end
+
+-- reload a plugin; a plugin that was disabled stays disabled (a reloaded plugin starts enabled)
+local function reload_keeping_state(it)
+  local was = it.enabled
+  local rc = ReloadPlugin(H.rid(it.id))
+  if rc == 0 and was == false then EnablePlugin(H.rid(it.id), false) end
+  return rc
+end
+
+local function act_reload(it)
+  if not it.loaded then say(it.name .. " is not loaded."); return end
+  if it.self then say("Reloading the manager..."); reload_self(it.id); return end
+  local rc = reload_keeping_state(it)
+  if rc ~= 0 then say("Could not reload " .. it.name .. ": " .. rc_text(rc)) else say("Reloaded " .. it.name .. ".") end
+  after_change()
+end
+
+local function act_unload(it)
+  if not it.loaded then say(it.name .. " is not loaded."); return end
+  if it.self then say("The manager does not unload itself. (pm disable would leave you without commands too.)"); return end
+  local rc = UnloadPlugin(H.rid(it.id))
+  if rc ~= 0 then say("Could not unload " .. it.name .. ": " .. rc_text(rc)) else say("Unloaded " .. it.name .. ". (pm save keeps it unloaded next time.)") end
+  after_change()
+end
+
+local function act_enable(it, on)
+  if not it.loaded then say(it.name .. " is not loaded."); return end
+  if it.self and not on then say("The manager does not disable itself."); return end
+  local rc = EnablePlugin(H.rid(it.id), on)
+  if rc ~= 0 then say("Could not " .. (on and "enable " or "disable ") .. it.name .. ": " .. rc_text(rc)) else say((on and "Enabled " or "Disabled ") .. it.name .. ".") end
+  after_change()
+end
+
+local function act_open(it)
+  local link = (it.m and it.m.repo) or (it.o and it.o.repo)
+  if not link or link == "" then say(it.name .. " has no repository link in the manifest."); return end
+  if not link:match("^https?://") then say("The link for " .. it.name .. " is not an http(s) address: " .. link); return end
+  OpenBrowser(link)
+  say("Opened " .. link)
+end
+
+local function author_of(it) return (it.author and it.author ~= "" and it.author) or (it.m and it.m.author) or (it.o and it.o.author) or "" end
+local function purpose_of(it)
+  local t = (it.m and it.m.purpose) or (it.purpose and it.purpose ~= "" and it.purpose) or (it.o and it.o.note) or ""
+  return (t:gsub("%s+", " "))
+end
+-- the file MUSHclient keeps a plugin's saved variables in: <plugins folder>\state\<world id>-<plugin id>-state.xml (only if it exists)
+local function state_path(it)
+  if not it.loaded or not it.id then return nil end
+  local dir = GetInfo(60) or ""
+  local sep = dir:find("/", 1, true) and "/" or "\\"
+  local p = dir .. "state" .. sep .. (GetWorldID and GetWorldID() or "") .. "-" .. H.rid(it.id) .. "-state.xml"
+  if exists(p) then return p end
+end
+local function act_state(it)
+  local p = state_path(it)
+  if not p then say(it.name .. " has no saved-state file yet (it has not saved anything, or it is not loaded)."); return end
+  if not (utils and utils.shellexecute) then say("This client cannot open files. The state file is " .. p); return end
+  local ok = utils.shellexecute(p, "", "", "edit", 1)                 -- the editor your system uses for .xml files; "open" if it has none
+  if not ok then ok = utils.shellexecute(p, "", "", "open", 1) end
+  say(ok and ("Opened " .. p .. ".  Close the plugin's changes in the editor only when you know what they mean; MUSHclient rewrites this file when the plugin saves.") or ("Could not open " .. p))
+end
+
+-- what a loaded plugin's aliases (or triggers) are, read from the plugin itself: match text, what it sends, its script, on/off
+local LISTING = {
+  alias   = { list = "GetPluginAliasList",   info = "GetPluginAliasInfo",   match = 1, send = 2, script = 3, on = 6, rx = 7, group = 16, many = "Aliases", one = "Alias" },
+  trigger = { list = "GetPluginTriggerList", info = "GetPluginTriggerInfo", match = 1, send = 2, script = 4, on = 8, rx = 9, group = 26, many = "Triggers", one = "Trigger" },
+}
+local function one_line(t, max)
+  t = tostring(t or ""):gsub("[\r\n]+", " / ")
+  if #t > max then t = t:sub(1, max) .. "..." end
+  return t
+end
+local function read_listing(it, kind)                  -- the plugin's aliases or triggers, as rows
+  local K = LISTING[kind]
+  local listf, infof = _G[K.list], _G[K.info]
+  if not (listf and infof) then return nil end
+  local rows = {}
+  for _, nm in ipairs(listf(H.rid(it.id)) or {}) do
+    local function get(sel) local ok, v = pcall(infof, H.rid(it.id), nm, sel); if ok then return v end end
+    local send, script, group = get(K.send), get(K.script), get(K.group)
+    rows[#rows + 1] = { match = tostring(get(K.match) or ""), send = (send and send ~= "") and tostring(send) or nil, script = (script and script ~= "") and tostring(script) or nil,
+                        group = (group and group ~= "") and tostring(group) or nil, on = get(K.on) ~= false, rx = get(K.rx) and true or false }
+  end
+  table.sort(rows, function(a, b) return a.match:lower() < b.match:lower() end)
+  return rows
+end
+local function listing_text(it, kind, rows)               -- plain text of the same rows (Copy, and the output window)
+  local K = LISTING[kind]
+  local out = { K.many .. " of " .. it.name .. "  (" .. #rows .. ")", "[on] / [off] = enabled or disabled, rx = regular expression", "" }
+  for _, r in ipairs(rows) do
+    out[#out + 1] = (r.on and "[on]  " or "[off] ") .. (r.rx and "rx  " or "    ") .. one_line(r.match, 300)
+    if r.send then out[#out + 1] = "          sends:  " .. one_line(r.send, 300) end
+    if r.script then out[#out + 1] = "          script: " .. r.script end
+    if r.group then out[#out + 1] = "          group:  " .. r.group end
+  end
+  if #rows == 0 then out[#out + 1] = "(none)" end
+  return table.concat(out, "\r\n")
+end
+local open_listing_window                                  -- the themed window that shows them (defined with the other windows); nil when unavailable
+local function act_listing(it, kind)
+  if not it.loaded then say(it.name .. " is not loaded, so its " .. LISTING[kind].many:lower() .. " cannot be read."); return end
+  local rows = read_listing(it, kind)
+  if not rows then say("This client cannot read a plugin's " .. LISTING[kind].many:lower() .. "."); return end
+  if open_listing_window and open_listing_window(it, kind) then return end
+  for line in (listing_text(it, kind, rows) .. "\r\n"):gmatch("(.-)\r\n") do ColourNote("silver", "", line) end
+end
+
+local function act_info(it)
+  say(it.name .. (it.ver and ("  v" .. it.ver) or "") .. "   [" .. it.group .. "]")
+  local function row(k, v) if v and v ~= "" then ColourNote("gray", "", string.format("  %-12s", k), "white", "", tostring(v)) end end
+  row("purpose", purpose_of(it) ~= "" and purpose_of(it) or "(none given)")
+  row("author", author_of(it))
+  row("state", it.loaded and (it.enabled and "loaded, enabled" or "loaded, disabled") or "not loaded")
+  row("id", it.id)
+  row("file", it.file)
+  if it.src then row("source", src_label(it.src) .. (it.src.def and "  (main manifest)" or "  (" .. it.src.url .. ")")) end
+  if it.m then
+    row("offered", "v" .. tostring(it.m.version) .. (it.update and "  (newer than yours)" or it.ahead and "  (yours is newer)" or ""))
+    row("repository", it.m.repo); row("changes", it.m.changes)
+  end
+  if it.o then row("repository", it.o.repo); row("note", it.o.note) end
+  local sp = state_path(it)
+  if sp then
+    ColourTell("gray", "", string.format("  %-12s", "state file")); ColourTell("white", "", sp .. "  ")
+    local ok = Hyperlink and pcall(Hyperlink, "!!" .. SELF .. ":pm_link(state " .. it.id .. ")", "[open in editor]", "Open the saved-state file in your editor", "deepskyblue", "black", 0, 1)
+    if not ok then ColourTell("deepskyblue", "", "[pm state " .. it.name .. "]") end
+    ColourNote("", "", "")
+  end
+end
+
+---------------------------------------------------------------------------
+-- Download, install, update
+---------------------------------------------------------------------------
+local function http_get(url, cb)                       -- cb(ok, body_or_reason)
+  if not async_ok then cb(false, "the async module is not available"); return end
+  if not tostring(url):match("^https://") then cb(false, "only https addresses are used (" .. tostring(url) .. ")"); return end
+  local done = false
+  local function result(ok, v)
+    if done then return end
+    done = true
+    local cok, cerr = pcall(cb, ok, v)
+    if not cok then busy = nil; say("Internal error: " .. tostring(cerr)) end
+  end
+  local ok, err = pcall(async.doAsyncRemoteRequest, url,
+    function(retval, page, status)
+      if type(status) ~= "number" then result(false, tostring(status or retval or "no answer"))
+      elseif status ~= 200 then result(false, "HTTP " .. status)
+      elseif type(page) ~= "string" then result(false, "no answer")
+      elseif #page > 6000000 then result(false, "the answer is too large (" .. #page .. " bytes)")
+      else result(true, page) end
+    end, nil, 30, function() result(false, "timed out") end)
+  if not ok then result(false, tostring(err)) end
+end
+
+-- the checksum is required: no checksum, or no way to compute one, means no install
+local function sha_hex(body)
+  local d = utils.sha256(body)
+  if #d == 32 then d = utils.tohex(d) end                       -- the client answers with the 32 raw bytes
+  return d:lower()
+end
+local function sha_ok(body, want)
+  if type(want) ~= "string" or want == "" then return false, "the manifest has no checksum for it" end
+  if not (utils and utils.sha256) then return false, "this client cannot compute the checksum" end
+  if sha_hex(body) == want:lower() then return true end
+  return false, "checksum does not match (the file is not the one the manifest describes)"
+end
+
+-- is this text the plugin the manifest entry says it is, complete, and does its script compile?
+local function plugin_attrs(body)                       -- the attributes of the <plugin ...> tag, read one by one so a ">" inside a value does not end the tag early
+  local _, e = body:sub(1, 12000):find("<plugin%s")
+  if not e then return nil end
+  local attrs, pos = {}, e + 1
+  while true do
+    local s0, f, k, v = body:find('^%s*([%w_%-]+)%s*=%s*"([^"]*)"', pos)
+    if not s0 then break end
+    attrs[k] = v; pos = f + 1
+  end
+  return attrs
+end
+
+local function plugin_text_ok(body, m)
+  if not body:find("<muclient", 1, true) or not body:find("<plugin", 1, true) then return false, "that is not a plugin file" end
+  if not body:match("</muclient>%s*$") then return false, "the plugin file is cut off (no closing tag)" end
+  local attrs = plugin_attrs(body) or {}
+  local id = attrs.id
+  if not id or id:lower() ~= m.id then return false, "the file's plugin id is not " .. m.id end
+  local ver = attrs.version
+  if not ver or tonumber(ver) ~= tonumber(m.version) then return false, "the file is version " .. tostring(ver) .. " but the manifest says " .. tostring(m.version) end
+  local code                                                       -- the first script block (plain searches: a hostile file cannot make a pattern run for ages)
+  local s1, e1 = body:find("<script>", 1, true)
+  if s1 then
+    -- the end marker is written in two parts below: this file is itself inside a CDATA block
+    local _, e2 = body:find("^%s*<!%[CDATA%[", e1 + 1)
+    if e2 then local s3 = body:find("]" .. "]>", e2 + 1, true); if s3 then code = body:sub(e2 + 1, s3 - 1) end end
+  end
+  if code then
+    local f, err = loadstring(code, "=plugin")
+    if not f then return false, "its script does not compile: " .. tostring(err) end
+  end
+  return true
+end
+
+---------------------------------------------------------------------------
+-- Reading the sources
+---------------------------------------------------------------------------
+local function fetch_manifest_source(src, cb)               -- a manifest at an address
+  http_get(src.url, function(ok, body)
+    if not ok then cb(false, body); return end
+    local m, why = parse_manifest(body)
+    if not m then cb(false, why); return end
+    src.data = m
+    save_cache(src, m)
+    cb(true)
+  end)
+end
+
+-- a plugin file's own description of itself, read from its <plugin> tag; nil when it does not look like a plugin
+local function plugin_meta(body)
+  if not body:find("<muclient", 1, true) then return nil end
+  local attrs = plugin_attrs(body)
+  if not attrs then return nil end
+  local function attr(n) return attrs[n] end
+  local id, name, ver = attr("id"), attr("name"), attr("version")
+  if not (id and #id == 24 and id:match("^%x+$") and name and name ~= "" and ver and ver:match("^%d+%.?%d*$")) then return nil end
+  local function unesc(t) return t and (t:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&amp;", "&")) end
+  return { id = id:lower(), name = (unesc(name):gsub("%c", " "):sub(1, 80)), version = ver, purpose = unesc(attr("purpose")), author = unesc(attr("author")) }
+end
+
+local MAX_SCAN = 40                                          -- plugin files looked at in one repository
+local MAX_SIZE = 1500000
+
+-- a repository (or a single plugin file) has no manifest: find the plugin files, read what each one says about itself and note its checksum.
+-- The checksum is checked again at install time, so what is installed is what was listed.
+local function detect_repo(src, cb)
+  local o, r, ref, sub = repo_parts(src.url)
+  local function finish(entries, name, skipped, extra)
+    if #entries == 0 then cb(false, "no plugin files found" .. (extra and (" (" .. extra .. ")") or "")); return end
+    local best = {}
+    for _, e in ipairs(entries) do if not best[e.id] or tonumber(e.version) > tonumber(best[e.id].version) then best[e.id] = e end end
+    local list = {}
+    for _, e in pairs(best) do list[#list + 1] = e end
+    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    local doc = { manifest = 1, name = name, plugins = list, outside = {} }
+    local m = normalize_manifest(doc)
+    if not m then cb(false, "the plugin files found could not be listed"); return end
+    src.data = m
+    save_cache(src, m)
+    local keep_note = src.note
+    src.note = skipped > 0 and (skipped .. " plugin(s) skipped" .. (src.skipnote and (" (" .. src.skipnote .. ")") or "")) or keep_note
+    cb(true)
+  end
+  if src.kind == "file" then                                   -- one plugin file at an address
+    http_get(src.url, function(ok, body)
+      if not ok then cb(false, body); return end
+      local meta = plugin_meta(body)
+      if not meta then cb(false, "that is not a plugin file"); return end
+      local pok, pwhy = plugin_text_ok(body, meta)
+      if not pok then cb(false, pwhy); return end
+      local file = (src.url:gsub("[?#].*$", ""):match("([^/]+)$") or "")
+      if not safe_name(file) then cb(false, "the file name is not usable: " .. file); return end
+      finish({ { id = meta.id, name = meta.name, version = meta.version, file = file, url = src.url, sha256 = sha_hex(body), purpose = meta.purpose, author = meta.author } }, file, 0)
+    end)
+    return
+  end
+  -- a repository: a manifest.json in it wins; otherwise list its files and look at the .xml ones
+  local function manifest_try(next_step)
+    local murl = raw_url(o, r, ref, sub ~= "" and (sub .. "/manifest.json") or "manifest.json")
+    http_get(murl, function(ok, body)
+      if ok then
+        local m = parse_manifest(body)
+        if m then
+          if not m.base then m.base = raw_url(o, r, ref, sub ~= "" and (sub .. "/") or "") end
+          src.data = m
+          save_cache(src, m)
+          cb(true); return
+        end
+      end
+      next_step()
+    end)
+  end
+  local function scan()
+    http_get("https://api.github.com/repos/" .. o .. "/" .. r .. "/git/trees/" .. ref .. "?recursive=1", function(ok, body)
+      if not ok then cb(false, "could not list the repository (" .. tostring(body) .. ")"); return end
+      local dok, tree = pcall(json.decode, body)
+      if not dok or type(tree) ~= "table" or type(tree.tree) ~= "table" then cb(false, "the repository listing could not be read"); return end
+      local blobs, xml, seen_all = {}, {}, 0
+      if tree.truncated == true then src.note = "the repository is too big to list completely" end
+      local prefix = sub ~= "" and (sub .. "/") or ""
+      for _, e in ipairs(tree.tree) do
+        local path = e.path
+        if type(path) == "string" and e.type == "blob" and path:sub(1, #prefix) == prefix and not path:find("^%.") and not path:find("/%.") then
+          local dir, file = path:match("^(.*)/([^/]+)$")
+          if not dir then dir, file = "", path end
+          local size = tonumber(e.size) or 0
+          blobs[#blobs + 1] = { path = path, dir = dir, file = file, size = size }
+          if file:lower():match("%.xml$") and safe_name(file) and size <= MAX_SIZE then
+            seen_all = seen_all + 1
+            if #xml < MAX_SCAN then xml[#xml + 1] = { path = path, dir = dir, file = file } end
+          end
+        end
+      end
+      local entries, skipped, i = {}, 0, 0
+      -- pass 2: the files a plugin needs. Everything in the plugin's own folder (and the folders below it) that is not a repository file (README, LICENSE, git.txt,
+      -- .gitignore ...) belongs to it, except the folders of other plugins found in the same repository.
+      local function dependencies()
+        local pdirs = {}
+        for _, e in ipairs(entries) do pdirs[e.cdir] = true end
+        local function owner_dir(bdir)
+          local best
+          for pd in pairs(pdirs) do
+            if pd == "" or pd == bdir or bdir:sub(1, #pd + 1) == pd .. "/" then if not best or #pd > #best then best = pd end end
+          end
+          return best
+        end
+        local jobs = {}                                        -- { entry, path, rel }
+        for _, e in ipairs(entries) do
+          local n = 0
+          for _, bl in ipairs(blobs) do
+            local rel
+            if e.cdir == "" then rel = bl.path elseif bl.path:sub(1, #e.cdir + 1) == e.cdir .. "/" then rel = bl.path:sub(#e.cdir + 2) end
+            if rel and bl.path ~= e.cpath and owner_dir(bl.dir) == e.cdir and not H.is_standard_file(bl.file) and not H.denied_file(bl.file) then
+              -- a file that belongs to the plugin but cannot be installed makes the plugin incomplete: it is left out of the list rather than offered broken
+              if bl.size > MAX_SIZE then e.incomplete = e.incomplete or (rel .. " is too large")
+              elseif not H.rel_ok(rel) then e.incomplete = e.incomplete or (rel .. " has a name or a place the manager does not use")
+              elseif n >= 80 then e.incomplete = e.incomplete or "it has more than 80 files"
+              else n = n + 1; jobs[#jobs + 1] = { e = e, path = bl.path, rel = rel } end
+            end
+          end
+        end
+        local k = 0
+        local function nextjob()
+          k = k + 1
+          local j = jobs[k]
+          if not j then
+            local complete = {}
+            for _, e in ipairs(entries) do
+              if e.failed or e.incomplete then
+                skipped = skipped + 1                                              -- a file it needs could not be fetched or installed: not listed (it would install broken)
+                src.skipnote = src.skipnote or (e.name .. ": " .. (e.incomplete or "a file it needs could not be downloaded"))
+              else
+                local stem = e.file:gsub("%.[Xx][Mm][Ll]$", "")
+                if #e.extras > 0 and safe_name(stem) then e.dir = stem end         -- a plugin with files of its own gets a folder of its own
+                e.cdir, e.cpath = nil, nil
+                complete[#complete + 1] = e
+              end
+            end
+            finish(complete, o .. "/" .. r, skipped, (seen_all > 0 and (seen_all .. " .xml file(s) looked at")) or "no .xml files")
+            return
+          end
+          http_get(raw_url(o, r, ref, j.path), function(cok, cbody)
+            if cok then j.e.extras[#j.e.extras + 1] = { file = j.rel, url = raw_url(o, r, ref, j.path), sha256 = sha_hex(cbody) }
+            else j.e.failed = (j.e.failed or 0) + 1 end
+            nextjob()
+          end)
+        end
+        nextjob()
+      end
+      local function nextfile()
+        i = i + 1
+        local c = xml[i]
+        if not c then dependencies(); return end
+        http_get(raw_url(o, r, ref, c.path), function(fok, fbody)
+          local meta = fok and plugin_meta(fbody)
+          local pok = meta and plugin_text_ok(fbody, meta)
+          if not (meta and pok) then if fok and meta then skipped = skipped + 1 end; nextfile(); return end
+          entries[#entries + 1] = { id = meta.id, name = meta.name, version = meta.version, file = c.file, url = raw_url(o, r, ref, c.path), sha256 = sha_hex(fbody),
+                                    purpose = meta.purpose, author = meta.author, repo = "https://github.com/" .. o .. "/" .. r, extras = {}, cdir = c.dir, cpath = c.path }
+          nextfile()
+        end)
+      end
+      nextfile()
+    end)
+  end
+  manifest_try(scan)
+end
+
+local function fetch_sources(cb)                            -- reads every source, one after the other; cb(any_ok, first_problem)
+  if #sources == 0 then cb(false, "no manifest address is set: pm manifest https://...   (or add a repository: pm source add URL)"); return end
+  local i, anyok, first = 0, false, nil
+  local function nextsrc()
+    i = i + 1
+    local src = sources[i]
+    if not src then
+      if anyok then checked_at = os.time(); SetVariable("manifest_at", tostring(checked_at)) end
+      refresh()
+      cb(anyok, first); return
+    end
+    local function done(ok, why)
+      src.err = (not ok) and tostring(why) or nil
+      if ok then anyok = true elseif not first then first = (#sources > 1 and (src_label(src) .. ": ") or "") .. tostring(why) end
+      nextsrc()
+    end
+    local f = src.kind == "manifest" and fetch_manifest_source or detect_repo
+    local ok, err = pcall(f, src, done)
+    if not ok then done(false, "internal error: " .. tostring(err)) end
+  end
+  nextsrc()
+end
+
+local function finish_job() busy = nil; after_change() end
+
+-- download every file of one entry, check them, then swap them in (old files kept as name.bak_DATE); cb(ok, reason)
+-- Either all files are swapped in or none: a failure part-way puts the already swapped ones back.
+local function apply_entry(it, target, cb)
+  local m = it.m
+  local files = { { url = resolve_url(m.url, it.src), path = target, sha = m.sha256, main = true } }
+  local used = { [target:lower()] = true }
+  for _, x in ipairs(m.extras or {}) do
+    local path = H.join_rel(dirname(target), x.file)
+    if used[path:lower()] then cb(false, "the manifest lists " .. x.file .. " twice"); return end
+    used[path:lower()] = true
+    files[#files + 1] = { url = resolve_url(x.url, it.src), path = path, sha = x.sha256 }
+  end
+  local got = {}
+  local dirs, dirlist = {}, {}                                   -- the folders the files go into: made now, looked at again when the files are ready
+  for _, f in ipairs(files) do
+    local d = dirname(f.path)
+    if d ~= "" and not dirs[d:lower()] then dirs[d:lower()] = true; dirlist[#dirlist + 1] = d end
+  end
+  for _, d in ipairs(dirlist) do H.make_dir(d) end
+  local function cleanup(temps) for _, t in ipairs(temps) do os.remove(t) end end
+  local function swap()
+    for _, d in ipairs(dirlist) do
+      if not H.dir_ok(d) then cb(false, "the folder " .. d .. " does not exist and could not be created: make it by hand and try again"); return end
+    end
+    local temps = {}
+    for k, g in ipairs(files) do
+      local tmp = g.path .. ".pm_new"
+      local ok, err = writefile(tmp, got[k])
+      if not ok then cleanup(temps); os.remove(tmp); cb(false, "could not write " .. tmp .. ": " .. tostring(err)); return end
+      temps[#temps + 1] = tmp
+    end
+    local done = {}                                              -- { path, bak } for every file already swapped
+    local function undo_done()
+      for j = #done, 1, -1 do
+        os.remove(done[j].path)
+        if done[j].bak ~= "" then os.rename(done[j].bak, done[j].path) end
+      end
+    end
+    for k, g in ipairs(files) do
+      local bak = ""
+      if exists(g.path) then
+        bak = backup_name(g.path)
+        local ok, err = os.rename(g.path, bak)
+        if not ok then undo_done(); cleanup(temps); cb(false, "could not move " .. g.path .. " aside: " .. tostring(err)); return end
+      end
+      local ok, err = os.rename(temps[k], g.path)
+      if not ok then
+        if bak ~= "" then os.rename(bak, g.path) end
+        undo_done(); cleanup(temps); cb(false, "could not put " .. g.path .. " in place: " .. tostring(err)); return
+      end
+      done[#done + 1] = { path = g.path, bak = bak }
+    end
+    local record, any = {}, false
+    for _, d in ipairs(done) do record[#record + 1] = d.path .. "\t" .. d.bak; if d.bak ~= "" then any = true end end
+    SetVariable("undo_" .. it.id, any and table.concat(record, "\n") or "")
+    local mine = {}
+    for k = 2, #files do mine[#mine + 1] = files[k].path end
+    SetVariable("files_" .. it.id, table.concat(mine, "\n"))
+    cb(true)
+  end
+  local function fetch(i)
+    local f = files[i]
+    if not f then swap(); return end
+    http_get(f.url, function(ok, body)
+      if not ok then cb(false, "download of " .. basename(f.path) .. " failed: " .. body); return end
+      local sok, swhy = sha_ok(body, f.sha)
+      if not sok then cb(false, basename(f.path) .. ": " .. swhy); return end
+      if f.main then
+        local pok, pwhy = plugin_text_ok(body, m)
+        if not pok then cb(false, basename(f.path) .. ": " .. pwhy); return end
+      end
+      got[i] = body
+      fetch(i + 1)
+    end)
+  end
+  fetch(1)
+end
+
+-- put the files the last update replaced back; returns the main file's path, or nil and why. The record is only cleared when everything went back.
+local function undo_files(it)
+  local rec = var("undo_" .. it.id, "")
+  if rec == "" then return nil, "nothing to undo for " .. it.name .. " (no update by the manager is on record)" end
+  local list = {}
+  for line in (rec .. "\n"):gmatch("(.-)\n") do
+    local path, bak = line:match("^(.-)\t(.*)$")
+    if path then list[#list + 1] = { path = path, bak = bak } end
+  end
+  for _, e in ipairs(list) do
+    if e.bak ~= "" and not exists(e.bak) then return nil, "the backup file is missing: " .. e.bak end
+  end
+  local function keep_from(i)                              -- what is left to do goes back on record, so a second try carries on
+    local t = {}
+    for j = i, #list do t[#t + 1] = list[j].path .. "\t" .. list[j].bak end
+    SetVariable("undo_" .. it.id, table.concat(t, "\n"))
+  end
+  for i, e in ipairs(list) do
+    local aside
+    if exists(e.path) then
+      aside = backup_name(e.path)
+      local ok, err = os.rename(e.path, aside)
+      if not ok then keep_from(i); return nil, "could not move " .. e.path .. " aside: " .. tostring(err) end
+    end
+    if e.bak ~= "" then
+      local ok, err = os.rename(e.bak, e.path)
+      if not ok then if aside then os.rename(aside, e.path) end; keep_from(i); return nil, "could not restore " .. e.path .. ": " .. tostring(err) end
+    end
+  end
+  SetVariable("undo_" .. it.id, "")
+  return list[1] and list[1].path
+end
+
+-- extra files the manager put in place for a plugin are remembered (files_<id>), so an update may replace them but never another plugin's file of the same name
+function H.owned(id, path) return ("\n" .. var("files_" .. id, ""):lower() .. "\n"):find("\n" .. path:lower() .. "\n", 1, true) ~= nil end
+function H.extras_conflict(id, target, m, only_shared)    -- the first extra file that would replace somebody else's file, or nil
+  local d = dirname(target)
+  if only_shared then                                      -- an existing plugin in a folder of its own may replace its own files; one in the shared plugins folder may not replace others'
+    local shared = d:lower() == (GetInfo(60) or ""):lower() or d:lower() == install_dir():lower()
+    if not shared then return nil end
+  end
+  for _, x in ipairs(m.extras or {}) do
+    local path = H.join_rel(d, x.file)
+    if exists(path) and not H.owned(id, path) then return x.file, path end
+  end
+end
+
+local function new_target(m)                              -- where a new install goes: a folder of its own when the manifest names one (plugins with extra files), else the install folder
+  local d = install_dir()
+  if m.dir then d = d .. m.dir .. H.sep_in(d) end
+  return d .. m.file
+end
+
+local function do_update(it, cb)                         -- cb(ok, text)
+  local m = it.m
+  if not m then cb(false, it.name .. " is not in the manifest."); return end
+  local installed = it.loaded
+  local target = installed and it.file or new_target(m)
+  if not target or target == "" then cb(false, "no file path known for " .. it.name); return end
+  if installed then
+    local cf = H.extras_conflict(it.id, target, m, true)
+    if cf then cb(false, it.name .. ": a file named " .. cf .. " is already in " .. dirname(target) .. " and was not put there by this plugin (it could be another plugin's), so it is not replaced. Move the plugin into a folder of its own, or remove that file."); return end
+  end
+  if not installed then                                  -- a new install never replaces a file that is already there (it could be another plugin's)
+    if exists(target) then cb(false, it.name .. ": a file named " .. basename(target) .. " is already in " .. dirname(target) .. " (not this plugin, or not loaded). Remove or rename it first."); return end
+    for _, x in ipairs(m.extras or {}) do
+      if exists(H.join_rel(dirname(target), x.file)) then cb(false, it.name .. ": a file named " .. x.file .. " is already in " .. dirname(target) .. ". Remove or rename it first."); return end
+    end
+  end
+  say((installed and "Updating " or "Installing ") .. it.name .. "...")
+  apply_entry(it, target, function(ok, why)
+    if not ok then cb(false, it.name .. ": " .. why); return end
+    if it.self then
+      say("Updated the manager's file (the old one is kept as " .. basename(target) .. ".bak_*); reloading it...")
+      reload_self(it.id)
+      cb(true, "updated"); return
+    end
+    local rc
+    if installed then rc = reload_keeping_state(it) else rc = LoadPlugin(target) end
+    if rc ~= 0 or not H.is_installed(it.id) then
+      local why2 = rc ~= 0 and rc_text(rc) or "it did not stay loaded"
+      if installed then
+        local main, uwhy = undo_files(it)
+        local rc2 = main and LoadPlugin(main)
+        if main and rc2 == 0 and H.is_installed(it.id) then
+          if it.enabled == false then EnablePlugin(H.rid(it.id), false) end
+          cb(false, it.name .. " did not load after the update (" .. why2 .. "); the previous version was put back.")
+        else
+          cb(false, it.name .. " did not load after the update (" .. why2 .. ") and the previous version could not be put back: " .. tostring(uwhy or (main and rc_text(rc2)) or "") .. "  Files: " .. target .. " and its .bak_ copy.")
+        end
+      else
+        cb(false, it.name .. " was downloaded to " .. target .. " but did not load: " .. why2)
+      end
+      return
+    end
+    cb(true, (installed and "Updated " or "Installed ") .. it.name .. " to v" .. tostring(m.version) .. (installed and "  (pm rollback " .. it.name .. " undoes it)" or "  (pm save keeps it loaded next time)"))
+  end)
+end
+
+local function run_jobs(list, verb)                      -- one at a time; the manager itself goes last, because its reload ends the run
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  table.sort(list, function(a, b) return (a.self and 1 or 0) < (b.self and 1 or 0) end)
+  local i, okc, failc = 0, 0, 0
+  busy = verb
+  local function nextjob()
+    i = i + 1
+    local it = list[i]
+    if not it then
+      say(verb .. " finished: " .. okc .. " done" .. (failc > 0 and (", " .. failc .. " failed") or "") .. ".")
+      finish_job(); return
+    end
+    local function done(ok, text)
+      if ok then okc = okc + 1 else failc = failc + 1 end
+      say(text)
+      DoAfterSpecial(0.2, "pm_next_job()", 12)
+    end
+    local pok, perr = pcall(do_update, it, done)
+    if not pok then done(false, it.name .. ": internal error: " .. tostring(perr)) end
+  end
+  _G.pm_next_job = nextjob
+  nextjob()
+end
+
+local function act_check(quiet, finished)               -- finished(ok, problem) is called when the check is over
+  if busy then if not quiet then say("Wait for the " .. busy .. " to finish.") end; return end
+  busy = "check"
+  fetch_sources(function(ok, why)
+    busy = nil
+    last_err = why and tostring(why) or nil
+    if finished then pcall(finished, ok, why) end
+    if not ok then
+      if not quiet then say("Could not read the manifest: " .. tostring(why)) end
+      after_change(); return
+    end
+    if why and not quiet then say("Not everything could be read: " .. tostring(why)) end
+    local n = updates_count()
+    if n > 0 then say(n .. " update" .. (n == 1 and "" or "s") .. " available:  pm list updates   (pm update all installs them)")
+    elseif not quiet then say("Everything listed is up to date.") end
+    after_change()
+  end)
+end
+
+function pm_autocheck()
+  if var("auto", "on") ~= "on" or #sources == 0 then return end
+  if os.time() - checked_at < 20 * 3600 then return end
+  act_check(true)
+end
+
+-- a yes/no question in a dialog (the window's buttons ask; typed commands do not, you just typed them). Without dialogs the answer is yes.
+local function confirm(msg)
+  if not (utils and utils.msgbox) then say("This client cannot show a question dialog; nothing was done. (Typed commands do not ask.)"); return false end
+  local ok, r = pcall(utils.msgbox, msg, "Plugin Manager", "yesno", "?", 2)
+  return ok and tostring(r):lower() == "yes"
+end
+
+-- an installed plugin an offered one could be a fork of: the same id, the same file name, or a very alike name
+local function norm_name(n) return (tostring(n or ""):lower():gsub("[^%w]", "")) end
+local function similar_loaded(it)
+  if not (it.m and it.src and not it.src.def) then return nil end
+  if it.loaded then return it end                                   -- the same plugin id is installed
+  local nn, ff = norm_name(it.m.name), (it.m.file or ""):lower()
+  local best, rank = nil, 0
+  for _, o in ipairs(items) do
+    if o.loaded and o ~= it and not o.header then
+      local on = norm_name(o.name)
+      local r = 0
+      if ff ~= "" and basename((o.file or ""):lower()) == ff then r = 3
+      elseif on ~= "" and on == nn then r = 2
+      elseif #nn >= 5 and #on >= 5 and (on:find(nn, 1, true) or nn:find(on, 1, true)) then r = 1 end
+      if r > rank then best, rank = o, r end
+    end
+  end
+  return best
+end
+
+-- force install: the plugin from a repository replaces the look-alike that is installed. The current plugin is backed up first (name.xml.bak_DATE),
+-- taken out of MUSHclient, and the repository's version put in; if that does not load, the old one is put back.
+local function act_force(it)
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  local m = it.m
+  if not (m and it.src and not it.src.def) then say("Force install is for a plugin a repository offers (Store tab)."); return end
+  local old = similar_loaded(it)
+  if not old then say("Nothing installed looks like " .. it.name .. ". Use  pm install  instead."); return end
+  if old.self then say("The manager does not replace itself this way (pm update does it)."); return end
+  local oldfile = old.file
+  if not oldfile or oldfile == "" then say("No file is known for " .. old.name .. ", so it cannot be backed up. Nothing was changed."); return end
+  local same_file = basename(oldfile):lower() == m.file:lower()
+  local target = same_file and oldfile or new_target(m)
+  if not same_file and exists(target) then say("A file named " .. m.file .. " is already in " .. dirname(target) .. ". Remove or rename it first. Nothing was changed."); return end
+  local cf = H.extras_conflict(m.id, target, m, same_file)
+  if cf then say("A file named " .. cf .. " is already in " .. dirname(target) .. " and was not put there by this plugin, so it is not replaced. Nothing was changed."); return end
+  local backup
+  if not same_file then                                             -- the update machinery only backs up the file it replaces: here a copy of the old plugin is made first
+    local body = readfile(oldfile)
+    if not body then say("Could not read " .. oldfile .. " to back it up. Nothing was changed."); return end
+    backup = backup_name(oldfile)
+    local ok, err = writefile(backup, body)
+    if not ok then say("Could not write the backup " .. backup .. ": " .. tostring(err) .. ". Nothing was changed."); return end
+  end
+  busy = "force install"
+  say("Force installing " .. it.name .. " v" .. tostring(m.version) .. " over " .. old.name .. "...")
+  local fake = { id = m.id, name = it.name, m = m, src = it.src }
+  apply_entry(fake, target, function(ok, why)
+    if not ok then
+      if backup then os.remove(backup) end
+      busy = nil; say("Force install failed: " .. tostring(why) .. "  (nothing was changed)"); after_change(); return
+    end
+    local was_enabled = old.enabled
+    UnloadPlugin(H.rid(old.id))
+    local rc = LoadPlugin(target)
+    if rc ~= 0 or not H.is_installed(m.id) then
+      local why2 = rc ~= 0 and rc_text(rc) or "it did not stay loaded"
+      if H.is_installed(m.id) then UnloadPlugin(H.rid(m.id)) end
+      local restored = undo_files(fake)                             -- the old file comes back (same file name) ...
+      if not restored and not same_file and exists(target) then os.rename(target, backup_name(target)) end     -- ... or the new file is set aside (never deleted)
+      local rc2 = LoadPlugin(oldfile)
+      if rc2 == 0 and was_enabled == false then EnablePlugin(H.rid(old.id), false) end
+      busy = nil
+      say("The repository's " .. it.name .. " did not load (" .. why2 .. "). " .. (rc2 == 0 and ("The previous plugin, " .. old.name .. ", was put back.") or ("Could not load the previous plugin again: " .. rc_text(rc2) .. "  Its file: " .. oldfile .. (backup and ("  Backup: " .. backup) or ""))))
+      after_change(); return
+    end
+    local kept = backup
+    if not kept then local rec = var("undo_" .. m.id, ""); kept = rec:match("\t(.-)\n") or rec:match("\t(.-)$") end
+    busy = nil
+    say("Installed " .. it.name .. " v" .. tostring(m.version) .. " in place of " .. old.name .. ". The previous plugin file is kept as " .. tostring(kept) .. ".  (pm save keeps this next time" ..
+        (same_file and ("; pm rollback " .. it.name .. " puts the old file back") or "") .. ")")
+    after_change()
+  end)
+end
+
+-- uninstall: take the plugin out of MUSHclient and nothing else. Its file, its saved state and its other files are never touched.
+local function act_remove(it)
+  if not it.loaded then say(it.name .. " is not loaded."); return end
+  if it.self then say("The manager does not remove itself."); return end
+  local file = it.file
+  if not file or file == "" then say("No file is known for " .. it.name .. ", so it is not removed."); return end
+  local rc = UnloadPlugin(H.rid(it.id))
+  if rc ~= 0 then say("Could not unload " .. it.name .. ": " .. rc_text(rc)); return end
+  say("Removed " .. it.name .. " from MUSHclient. Its file (" .. file .. ") and its saved data are untouched.  (pm save, so it stays out next time; pm load adds it back)")
+  after_change()
+end
+
+-- add a plugin file the player downloaded by hand: check it, copy it into the plugins folder (unless it is already inside), load it
+local function same_dir_file(path, name) return dirname(path) .. name end
+local function act_add(path)
+  path = trim(path):gsub('^"(.*)"$', "%1")
+  if path == "" then say("pm add FILE   (the path of a plugin .xml file you downloaded)"); return end
+  if not path:match("^%a:[\\/]") and not path:match("^[\\/]") then path = (GetInfo(60) or "") .. path end
+  local body = readfile(path)
+  if not body then say("Cannot read " .. path); return end
+  local meta = plugin_meta(body)
+  if not meta then say(basename(path) .. " does not look like a MUSHclient plugin file (no <plugin> tag with a 24 character id, a name and a numeric version)."); return end
+  local pok, pwhy = plugin_text_ok(body, meta)
+  if not pok then say(basename(path) .. ": " .. pwhy); return end
+  if H.is_installed(meta.id) then
+    say(meta.name .. " is already loaded (" .. tostring(GetPluginInfo(H.rid(meta.id), 6)) .. "). To replace it, remove it first, then add the file again.")
+    return
+  end
+  local root = (GetInfo(60) or ""):lower():gsub("/", "\\")
+  local inside = root ~= "" and path:lower():gsub("/", "\\"):sub(1, #root) == root
+  local target, made, aside = path, {}, {}
+  if not inside then
+    if not safe_name(basename(path)) then say("The file name " .. basename(path) .. " is not usable (letters, digits, _ - . and spaces): rename it first."); return end
+    target = install_dir() .. basename(path)
+    local function put(to, text)
+      if exists(to) then
+        local bak = backup_name(to)
+        local ok, err = os.rename(to, bak)
+        if not ok then return false, "could not move " .. to .. " aside: " .. tostring(err) end
+        aside[#aside + 1] = { to = to, bak = bak }
+      end
+      local ok, err = writefile(to, text)
+      if not ok then return false, "could not write " .. to .. ": " .. tostring(err) end
+      made[#made + 1] = to
+      return true
+    end
+    local ok, err = put(target, body)
+    if not ok then
+      for _, f in ipairs(made) do os.remove(f) end
+      for j = #aside, 1, -1 do os.rename(aside[j].bak, aside[j].to) end
+      say(err); return
+    end
+    local words = {}                                             -- .lua files next to it that it names: copied along, never over an existing file
+    for w in body:gmatch('["\']([%w_%-%.]+)["\']') do words[w] = true end
+    for w in body:gmatch("([%w_%-]+)%.lua") do words[w] = true end
+    local n = 0
+    for w in pairs(words) do
+      local f = w:gsub("%.lua$", "") .. ".lua"
+      if n < 6 and safe_name(f) and exists(same_dir_file(path, f)) and not exists(install_dir() .. f) then
+        local text = readfile(same_dir_file(path, f))
+        if text then
+          if put(install_dir() .. f, text) then n = n + 1 end
+        end
+      end
+    end
+  end
+  local rc = LoadPlugin(target)
+  if rc ~= 0 or not H.is_installed(meta.id) then
+    for _, f in ipairs(made) do os.remove(f) end
+    for j = #aside, 1, -1 do os.rename(aside[j].bak, aside[j].to) end
+    say("Could not load " .. basename(path) .. ": " .. (rc ~= 0 and rc_text(rc) or "it did not stay loaded") .. (#made > 0 and "  (the copy was taken back out)" or ""))
+    return
+  end
+  say("Added " .. meta.name .. " v" .. meta.version .. (inside and "" or (" (copied to " .. target .. ")")) .. ".  (pm save keeps it loaded next time)")
+  after_change()
+end
+
+-- a GitHub user or organization: list its repositories, then either let the player pick the ones to add, or look through all of them for plugins
+local open_owner_window                                    -- the checklist window (defined with the other windows); nil when themed windows are not available
+local function fetch_owner_repos(owner, cb)                -- cb(ok, repos | reason)
+  local all, page = {}, 0
+  local function nextpage()
+    page = page + 1
+    http_get("https://api.github.com/users/" .. owner .. "/repos?per_page=100&page=" .. page, function(ok, body)
+      if not ok then
+        local why = tostring(body)
+        if why == "HTTP 404" then why = "GitHub has no user or organization called " .. owner
+        elseif why == "HTTP 403" or why == "HTTP 429" then why = "GitHub says too many requests (without an account it allows 60 an hour): try again later" end
+        if page > 1 and #all > 0 then table.sort(all, function(a, b) return a.name:lower() < b.name:lower() end); cb(true, all, "only the first " .. #all .. " repositories could be listed (" .. why .. ")") else cb(false, why) end
+        return
+      end
+      local dok, t = pcall(json.decode, body)
+      if not dok or type(t) ~= "table" then cb(false, "the list of repositories could not be read"); return end
+      for _, r in ipairs(t) do
+        if type(r) == "table" and type(r.name) == "string" and r.name:match("^[%w_%-%.]+$") then
+          all[#all + 1] = { name = r.name, url = "https://github.com/" .. owner .. "/" .. r.name, desc = type(r.description) == "string" and r.description or "",
+                            fork = r.fork == true, archived = r.archived == true, empty = (tonumber(r.size) or 1) == 0, pushed = type(r.pushed_at) == "string" and r.pushed_at:sub(1, 10) or "" }
+        end
+      end
+      if #t >= 100 and page < 5 then nextpage()
+      else table.sort(all, function(a, b) return a.name:lower() < b.name:lower() end); cb(true, all) end
+    end)
+  end
+  nextpage()
+end
+
+local function add_repo_sources(urls)                      -- put these repositories on the source list (already listed ones are skipped); returns how many were new
+  local have, t, n = {}, {}, 0
+  for _, s0 in ipairs(sources) do have[canon_url(s0.url)] = true; if not s0.def then t[#t + 1] = s0.url end end
+  for _, u in ipairs(urls) do if not have[canon_url(u)] then have[canon_url(u)] = true; t[#t + 1] = u; n = n + 1 end end
+  SetVariable("sources", table.concat(t, "\n"))
+  build_sources()
+  refresh()                                                 -- the rows must point at the new source tables, or the Store tab shows nothing until the next check ends
+  return n
+end
+
+local SCAN_MAX = 50                                        -- repositories looked through in one go (the tree request counts against GitHub's 60 an hour)
+local function scannable(repos)                            -- forks, archived and empty repositories are skipped, and so are the ones already listed (a second run goes on where the first stopped)
+  local list, have = {}, {}
+  for _, s0 in ipairs(sources) do have[canon_url(s0.url)] = true end
+  for _, r in ipairs(repos) do if not (r.fork or r.archived or r.empty or have[canon_url(r.url)]) then list[#list + 1] = r end end
+  return list
+end
+local function scan_repos(owner, list, progress, done)     -- look at each repository for plugin files; the ones that have some become sources. done(found_count, problem)
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  busy = "repository scan"
+  local capped = #list > SCAN_MAX
+  local i, found, rate = 0, {}, false
+  local function finish()
+    busy = nil
+    local urls = {}
+    for _, f in ipairs(found) do urls[#urls + 1] = f.url end
+    local n = add_repo_sources(urls)
+    local problem = rate and "GitHub's request limit was reached (60 an hour without an account): the rest were not looked at. Try again later." or (capped and ("Only " .. SCAN_MAX .. " repositories were looked at this time; run it again to go on with the rest.") or nil)
+    refresh()
+    done(#found, problem, n)
+    after_change()
+  end
+  local function nxt()
+    i = i + 1
+    local r = list[i]
+    if not r or rate or i > SCAN_MAX then finish(); return end
+    if progress then progress("Looking at " .. i .. "/" .. math.min(#list, SCAN_MAX) .. ": " .. r.name) end
+    local src = { url = r.url, kind = "repo" }
+    local ok, err = pcall(detect_repo, src, function(sok, why)
+      if sok and src.data and #src.data.plugins > 0 then found[#found + 1] = { url = r.url, name = r.name, count = #src.data.plugins }
+      elseif sok then drop_cache(src)                          -- no plugins in it: it is not kept in the cache
+      elseif not sok and (tostring(why):find("HTTP 403", 1, true) or tostring(why):find("HTTP 429", 1, true)) then rate = true end
+      nxt()
+    end)
+    if not ok then nxt() end
+  end
+  nxt()
+end
+
+local function act_add_owner(owner, scan_now)
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  busy = "repository list"
+  say("Reading the repositories of " .. owner .. "...")
+  fetch_owner_repos(owner, function(ok, repos, partial)
+    busy = nil
+    if not ok then say("Could not read the repositories of " .. owner .. ": " .. tostring(repos)); return end
+    if #repos == 0 then say(owner .. " has no public repositories."); return end
+    if scan_now then
+      local list = scannable(repos)
+      if #list == 0 then say("Nothing to look at: the repositories of " .. owner .. " are forks, archived, empty or already listed."); return end
+      say("Looking through " .. math.min(#list, SCAN_MAX) .. " repositories of " .. owner .. " for plugins...")
+      scan_repos(owner, list, nil, function(n, problem)
+        say("Found plugins in " .. n .. " repositor" .. (n == 1 and "y" or "ies") .. " of " .. owner .. (n > 0 and ("; they are on the Store tab (pm source lists them).") or "."))
+        if problem then say(problem) end
+      end)
+      return
+    end
+    if open_owner_window and open_owner_window(owner, repos, partial) then return end
+    if partial then say("Note: " .. partial) end
+    say(owner .. " has " .. #repos .. " repositories:")
+    for _, r in ipairs(repos) do ColourNote("gray", "", "  ", "white", "", r.name, "gray", "", (r.fork and "  fork" or "") .. (r.archived and "  archived" or "") .. (r.desc ~= "" and ("   " .. r.desc:sub(1, 70)) or "")) end
+    say("Add one with  pm source add https://github.com/" .. owner .. "/NAME   or look through all of them:  pm source scan https://github.com/" .. owner)
+  end)
+end
+
+-- add a source (a repository, a manifest, a plugin file)
+local function act_add_source(url)
+  if busy then say("Wait for the " .. busy .. " to finish."); return false end
+  url = normalize_source(url or "")
+  local owner = owner_of(url)
+  if owner then act_add_owner(owner, false); return false end          -- a user or organization: a checklist of its repositories
+  local kind = kind_of(url)
+  if not kind then say("That is not an address I can use. Give an https:// link to a GitHub repository (https://github.com/OWNER/REPO), a manifest (.json) or a plugin file (.xml)."); return false end
+  for _, s in ipairs(sources) do if canon_url(s.url) == canon_url(url) then say("Already listed: " .. url); return false end end
+  local label = src_label({ url = url })
+  local t = {}
+  for _, s in ipairs(sources) do if not s.def then t[#t + 1] = s.url end end
+  t[#t + 1] = url
+  SetVariable("sources", table.concat(t, "\n"))
+  build_sources()
+  after_change()
+  say("Added " .. label .. ". Plugins from outside sources run inside MUSHclient, so install only from people you trust. Nothing is installed without a command or a click.")
+  return true
+end
+
+local function remove_sources(list, label)                -- stop listing these sources (never touches installed plugins)
+  if busy then say("Wait for the " .. busy .. " to finish."); return false end
+  local gone = {}
+  for _, s0 in ipairs(list) do gone[s0.url] = true; drop_cache(s0) end
+  local keep = {}
+  for _, s0 in ipairs(sources) do if not s0.def and not gone[s0.url] then keep[#keep + 1] = s0.url end end
+  SetVariable("sources", table.concat(keep, "\n"))
+  build_sources()
+  after_change()
+  say("Stopped listing " .. label .. ". Plugins already installed from " .. (#list == 1 and "it" or "them") .. " stay installed.")
+  return true
+end
+local function owner_sources(key)                          -- every source of one owner (key as owner_key gives it, any case)
+  local list = {}
+  for _, s0 in ipairs(sources) do if not s0.def and owner_key(s0):lower() == key:lower() then list[#list + 1] = s0 end end
+  return list
+end
+local function act_remove_owner(key)
+  local list = owner_sources(key)
+  if #list == 0 then say("No source belongs to " .. key .. "."); return false end
+  return remove_sources(list, (#list == 1 and src_label(list[1]) or (owner_key(list[1]) .. " (" .. #list .. " repositories)")))
+end
+local function act_remove_source(arg)
+  if busy then say("Wait for the " .. busy .. " to finish."); return false end
+  arg = trim(arg)
+  local list = {}
+  for _, s0 in ipairs(sources) do if not s0.def then list[#list + 1] = s0 end end
+  local src
+  local n = tonumber(arg)
+  if n then src = list[n]
+  else
+    local hits = {}
+    for _, s0 in ipairs(list) do if s0.url:lower() == arg:lower() or src_label(s0):lower() == arg:lower() then hits[#hits + 1] = s0 end end
+    if #hits > 1 then say("More than one source is called " .. arg .. ": use its number (pm source lists them), or its full address."); return false end
+    src = hits[1]
+    if not src and arg ~= "" and #owner_sources(arg) > 0 then return act_remove_owner(arg) end       -- an owner's name: all of its sources
+  end
+  if not src then say("No such source. pm source lists them (the main manifest is changed with pm manifest)."); return false end
+  return remove_sources({ src }, src_label(src))
+end
+
+---------------------------------------------------------------------------
+-- Text list
+---------------------------------------------------------------------------
+local function window_update_all()
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  local list, outside_n = {}, 0
+  for _, it in ipairs(items) do if it.update then list[#list + 1] = it; if it.src and not it.src.def then outside_n = outside_n + 1 end end end
+  if #list == 0 then say("No updates are waiting. (Check asks the sources again.)"); return end
+  if outside_n > 0 and not confirm("Update " .. #list .. " plugin(s), " .. outside_n .. " of them from repositories you added?\n\nThey run inside MUSHclient: only continue if you trust those sources.") then return end
+  run_jobs(list, "update")
+end
+local function source_host(it)
+  return (resolve_url(it.m.url, it.src):match("^https://([^/]+)") or "?")
+end
+local function confirm_outside(act, it)                  -- true when the plugin is not from a repository, or the player said yes
+  if not (it.src and not it.src.def and it.m) then return true end
+  return confirm((act == "update" and "Update " or "Install ") .. it.name .. " v" .. tostring(it.m.version) .. " from " .. src_label(it.src) ..
+    "?\n\nThe file comes from " .. source_host(it) .. ".\nThis plugin is not from the main manifest: it will run inside MUSHclient. Only continue if you trust that source.")
+end
+
+-- what the links in the list call. Installing or updating from a repository asks first, here as in the window.
+function pm_link(cmd)
+  local verb, rest = cmd:match("^(%S+)%s*(.*)$")
+  if verb == "update" and rest:lower() == "all" then window_update_all(); return end
+  if verb == "install" or verb == "update" then
+    local it = find(rest)
+    if it and it.m and not confirm_outside(verb, it) then return end
+  end
+  pm_command("pm", "pm " .. cmd, { cmd })
+end
+local function link(cmd, label, hint)
+  local ok = Hyperlink and pcall(Hyperlink, "!!" .. SELF .. ":pm_link(" .. cmd .. ")", label, hint or ("pm " .. cmd), "deepskyblue", "black", 0, 1)
+  if not ok then ColourTell("deepskyblue", "", label) end
+  ColourTell("", "", " ")
+end
+
+local function print_list(which)
+  refresh()
+  local rows = filter_rows(which)
+  listed = {}
+  for n, it in ipairs(rows) do listed[n] = key_of(it) end
+  if #rows == 0 then say("Nothing to show" .. (which ~= "all" and (" under " .. which) or "") .. "."); return end
+  local last
+  for n, it in ipairs(rows) do
+    if it.group ~= last then
+      last = it.group
+      ColourNote("silver", "", "")
+      ColourNote("silver", "", (it.group == "mine" and OWNER or it.group == "stock" and "Stock (AardMUSHclient package)" or it.group == "other" and "Other" or it.group == "store" and "Store (from the repositories you added)" or "Outside packages (links only)"))
+    end
+    local col = it.update and "orange" or (it.loaded and (it.enabled and "lime" or "gray") or "silver")
+    ColourTell("gray", "", string.format("%3d  ", n))
+    ColourTell(col, "", string.format("%-30s", it.name:sub(1, 30)))
+    local ver = it.ver and ("v" .. it.ver) or (it.m and ("v" .. tostring(it.m.version)) or "")
+    ColourTell("silver", "", string.format("%-8s", ver))
+    local state = it.update and ("-> v" .. tostring(it.m.version)) or (it.outside and "link only" or (not it.loaded and "not loaded") or (not it.enabled and "disabled") or (it.ahead and "newer than server") or "")
+    ColourTell(it.update and "orange" or "gray", "", string.format("%-18s", state))
+    if it.loaded then
+      link("reload " .. n, "[reload]"); link((it.enabled and "disable " or "enable ") .. n, it.enabled and "[disable]" or "[enable]")
+      if it.update then link("update " .. n, "[update]") end
+      if not it.self then link("remove " .. n, "[remove]", "Uninstall it from MUSHclient (its file and data stay)") end
+    elseif it.m then link("install " .. n, "[install]") end
+    if (it.m and it.m.repo) or (it.o and it.o.repo) then link("open " .. n, "[repo]", "Open the repository link") end
+    ColourNote("", "", "")
+  end
+  local u = updates_count()
+  ColourNote("gray", "", checked_at > 0 and ("Checked " .. os.date("%Y-%m-%d %H:%M", checked_at) .. ".") or "Nothing has been checked yet: pm check",
+             u > 0 and "orange" or "gray", "", u > 0 and ("  " .. u .. " update(s): pm update all") or "")
+end
+
+---------------------------------------------------------------------------
+-- Window
+---------------------------------------------------------------------------
+local ok_theme = pcall(require, "themed_miniwindows")
+local ok_sb = pcall(require, "scrollbar")                  -- the package's scroll bar (arrows, draggable thumb), the one the themed text windows use
+local sb = nil
+local sb_step                                              -- called by the scroll bar when it moves (defined after safeDraw)
+local FONT, FONT_B, FONT_S = "pm_f", "pm_fb", "pm_fs"
+local PAD, ROW_PAD = 8, 4
+local TW
+local closing = false                      -- the plugin is closing: the window being deleted then is not the user closing it
+local added = {}
+local view = { tab = "mine", top = 0, lh = 14 }
+local menuIdx = {}
+local fontName = GetAlphaOption("output_font_name")          -- the world's output font: used for the title bar, and for the list unless one was chosen
+local fontHeight = GetOption("output_font_height")
+local function font_spec()                                       -- the list font: the one chosen with pm font, else the output font
+  local n = var("font_name", "")
+  if n == "" then n = fontName end
+  local sz = tonumber(var("font_size", "")) or fontHeight
+  return n, sz
+end
+
+local function rgb(r, g, b) return r + g * 256 + b * 65536 end
+local function split(c) return c % 256, math.floor(c / 256) % 256, math.floor(c / 65536) % 256 end
+local function mixC(c1, c2, t)
+  local r1, g1, b1 = split(c1); local r2, g2, b2 = split(c2)
+  return rgb(math.floor(r1 + (r2 - r1) * t), math.floor(g1 + (g2 - g1) * t), math.floor(b1 + (b2 - b1) * t))
+end
+local function lum(c) local r, g, b = split(c); return 0.299 * r + 0.587 * g + 0.114 * b end
+local function palette()
+  local bg, theme_tx = Theme.PRIMARY_BODY, Theme.BODY_TEXT
+  local tx = mixC(theme_tx, lum(theme_tx) >= lum(bg) and rgb(255, 255, 255) or rgb(0, 0, 0), 0.3)       -- a little further from the background than the theme's own text
+  return { bg = bg, text = tx, muted = mixC(tx, bg, 0.25), panel = mixC(bg, tx, 0.09), edge = mixC(bg, tx, 0.24), hot = mixC(bg, tx, 0.16),
+           on = rgb(70, 190, 105), off = mixC(tx, bg, 0.5), warn = rgb(235, 165, 60), idle = rgb(90, 150, 240), sel = mixC(bg, rgb(70, 130, 230), 0.35) }
+end
+
+local function textW(font, s) return WindowTextWidth(WIN, font, s) end
+local function text(font, s, x, y, col) return WindowText(WIN, font, s, x, y, 0, 0, col, false) end
+local function fillRect(x1, y1, x2, y2, col) WindowRectOp(WIN, 2, x1, y1, x2, y2, col) end
+local function roundRect(x1, y1, x2, y2, fill, edge) WindowCircleOp(WIN, 3, x1, y1, x2, y2, edge or fill, 0, 1, fill, 0, 8, 8) end
+local function disc(x1, y1, x2, y2, col) WindowCircleOp(WIN, 1, x1, y1, x2, y2, col, 0, 1, col, 0) end
+local function fit(font, s, maxw)
+  if maxw <= 0 then return "" end
+  if textW(font, s) <= maxw then return s end
+  while #s > 1 and textW(font, s .. "...") > maxw do s = s:sub(1, -2) end
+  return s .. "..."
+end
+local function setupFonts()
+  local name, size = font_spec()
+  WindowFont(WIN, FONT, name, size, false)
+  WindowFont(WIN, FONT_B, name, size, true)
+  WindowFont(WIN, FONT_S, name, math.max(7, size - 1), false)
+  view.lh = WindowFontInfo(WIN, FONT, 1) + 1
+end
+local function hotspot(id, x1, y1, x2, y2, tip)
+  if WindowMoveHotspot(WIN, id, x1, y1, x2, y2) ~= 0 then
+    WindowAddHotspot(WIN, id, x1, y1, x2, y2, "", "", "", "", "PM_click", tip or "", 1, 0)
+    -- the wheel goes to the hotspot under the mouse only, and the rows and their buttons sit on top of the list's own hotspot: they need the handler too
+    if id:match("^z") or id:match("^b_%a+_%d+$") then WindowScrollwheelHandler(WIN, id, "PM_wheel") end
+  end
+  added[id] = true
+end
+local function dropHotspots()
+  for id in pairs(added) do WindowDeleteHotspot(WIN, id) end
+  added = {}
+end
+
+local TAB_LABEL = { all = "All", mine = OWNER, stock = "Stock", other = "Other", store = "Store" }
+local TAB_ORDER = { "mine", "stock", "other", "store", "all" }
+
+local function rowButtons(it)                              -- the buttons a row gets, right to left
+  local b = {}
+  if it.loaded then
+    if it.update then b[#b + 1] = { "update", "Update", "Download v" .. tostring(it.m and it.m.version) .. ", keep the old file, reload it" } end
+    if not it.self then b[#b + 1] = { it.enabled and "disable" or "enable", it.enabled and "Off" or "On", it.enabled and "Disable this plugin" or "Enable this plugin", "Off" } end   -- 4th: the label the width is taken from
+    b[#b + 1] = { "reload", "Reload", "Reload this plugin" }
+    if not it.self then b[#b + 1] = { "remove", "Remove", "Uninstall it from MUSHclient (its file and data stay)" } end
+  elseif it.m then b[#b + 1] = { "install", "Install", "Download it and load it" }
+  elseif it.outside then b[#b + 1] = { "open", "Open", "Open the repository link in your browser" } end
+  return b
+end
+
+local function draw()
+  local win = TW
+  if not win or not win.bodyleft then return end
+  setupFonts()
+  local P = palette()
+  dropHotspots()
+  win:blank()
+  local L, T, R, B = win.bodyleft, win.bodytop, win.bodyright, win.bodybottom
+  local W, lh = R - L + 1, view.lh
+  local x = L
+  -- the two big buttons on the right first, then as many tabs as fit on the left
+  local barH = lh + 12
+  local rx = R - PAD
+  local function bigButton(label, id, tip, col)
+    local bw = textW(FONT_S, label) + 14
+    if rx - bw < L + 90 then return end
+    roundRect(rx - bw, T + 5, rx, T + 3 + lh + 4, P.panel, P.edge)
+    text(FONT_S, label, rx - bw + 7, T + 7, col or P.text)
+    hotspot(id, rx - bw, T + 5, rx, T + 3 + lh + 4, tip)
+    rx = rx - bw - 5
+  end
+  bigButton(busy and "Working..." or "Check", "b_check", "Read the manifest and the repositories, and mark plugins that have a newer version", busy and P.warn or nil)
+  if updates_count() > 0 then bigButton("Update all", "b_updall", "Install every update that is waiting", P.warn) end
+  bigButton("Add", "b_add", "Add a plugin file you downloaded yourself")
+  if view.tab == "store" then bigButton("Repos", "b_repos", "Add or remove a repository plugins are listed from") end
+  local cx = L + PAD
+  for _, name in ipairs(TAB_ORDER) do
+    local label = TAB_LABEL[name]
+    local tw = textW(FONT_S, label) + 14
+    if cx + tw > rx - 4 then break end
+    local on = view.tab == name
+    roundRect(cx, T + 5, cx + tw, T + 3 + lh + 4, on and P.sel or P.panel, on and P.idle or P.edge)
+    text(FONT_S, label, cx + 7, T + 7, on and P.text or P.muted)
+    hotspot("a_tab_" .. name, cx, T + 5, cx + tw, T + 3 + lh + 4, "Show " .. TAB_LABEL[name]:lower())
+    cx = cx + tw + 4
+  end
+  WindowLine(WIN, L, T + barH, R, T + barH, P.edge, 0, 1)
+  -- footer: the selected plugin
+  local footH = lh * 3 + 14
+  local hdrH = lh + 4                                           -- the column header line
+  local listTop, listBottom = T + barH + 1 + hdrH, B - footH
+  WindowLine(WIN, L, listBottom, R, listBottom, P.edge, 0, 1)
+  -- rows
+  shown = build_shown(view.tab)
+  local rowH = lh + ROW_PAD * 2 + 2
+  local visible = math.max(1, math.floor((listBottom - listTop) / rowH))
+  local maxTop = math.max(0, #shown - visible)
+  if view.top > maxTop then view.top = maxTop end
+  if view.top < 0 then view.top = 0 end
+  local sbw = ok_sb and ((Theme.RESIZER_SIZE or 14)) or 0         -- width of the scroll bar on the right
+  local RR = R - sbw - (sbw > 0 and 1 or 0)                          -- rows end here
+  local cName = L + PAD + lh + 4                               -- columns: plugin, version, author (the state word follows the author when there is room)
+  local colV = cName + math.max(130, math.floor(W * 0.27))
+  local colA = colV + math.max(85, math.floor(W * 0.14))
+  text(FONT_S, "Plugin", cName, T + barH + 3, P.muted); text(FONT_S, "Version", colV, T + barH + 3, P.muted); text(FONT_S, "Author", colA, T + barH + 3, P.muted)
+  WindowLine(WIN, L, listTop - 1, R, listTop - 1, P.edge, 0, 1)
+  hotspot("zz_list", L, listTop, R, listBottom, "")          -- hotspots are tried in name order: the rows ("z_row") come before this one
+  WindowScrollwheelHandler(WIN, "zz_list", "PM_wheel")
+  if #shown == 0 then
+    local none = "No plugins here."
+    if view.tab == "store" then
+      local extra = 0
+      for _, sx in ipairs(sources) do if not sx.def then extra = extra + 1 end end
+      if extra == 0 then none = "No repositories yet. Press Repos > Add a repository (a GitHub address), or type  pm source add https://github.com/OWNER/REPO"
+      else none = "Nothing found in the repositories yet. Press Check." end
+    end
+    text(FONT, fit(FONT, none, W - 2 * PAD - sbw), L + PAD, listTop + PAD, P.muted)
+  end
+  for i = 1, visible do
+    local n = view.top + i
+    local it = shown[n]
+    if not it then break end
+    local y1 = listTop + (i - 1) * rowH
+    local y2 = y1 + rowH - 1
+    local ind = shown_indent[it] or 0
+    if it.header then                                                    -- an owner or a repository: click to open it (the others close)
+      fillRect(L, y1, RR, y2, it.header == "owner" and P.hot or P.panel)
+      text(FONT_B, it.open and "v" or ">", L + PAD + ind, y1 + ROW_PAD, P.idle)
+      local rmlabel = (it.header == "owner" and it.repos > 1) and "Remove repos" or "Remove repo"
+      local rmw = textW(FONT_S, rmlabel) + 14                           -- the button at the right end of the header
+      local label = fit(FONT_B, it.name, RR - L - 260 - ind - rmw)
+      text(it.header == "owner" and FONT_B or FONT, label, cName + ind, y1 + ROW_PAD, P.text)
+      local lx = cName + ind + textW(FONT_B, label) + 10
+      local info
+      if it.header == "owner" then
+        info = (it.repos > 1 and (it.repos .. " repositories, ") or "") .. it.count .. " plugin" .. (it.count == 1 and "" or "s")
+      else info = it.count .. " plugin" .. (it.count == 1 and "" or "s") end
+      if it.ups > 0 then info = info .. ", " .. it.ups .. " update" .. (it.ups == 1 and "" or "s") end
+      local bad = it.header == "owner" and it.nerr and it.nerr > 0
+      if it.header == "repo" and it.err then info = "could not be read: " .. it.err
+      elseif bad then info = info .. "   (" .. (it.repos == 1 and ("could not be read: " .. it.err) or (it.nerr .. " could not be read")) .. ")" end
+      text(FONT_S, fit(FONT_S, info, RR - lx - PAD - rmw - 6), lx, y1 + ROW_PAD + 1, (bad or (it.header == "repo" and it.err) or it.ups > 0) and P.warn or P.muted)
+      roundRect(RR - PAD - rmw, y1 + 2, RR - PAD, y2 - 2, P.hot, P.edge)
+      text(FONT_S, rmlabel, RR - PAD - rmw + 7, y1 + ROW_PAD + 1, P.text)
+      hotspot("b_forget_" .. n, RR - PAD - rmw, y1 + 2, RR - PAD, y2 - 2, it.header == "owner" and "Stop listing everything from this owner (installed plugins stay)" or "Stop listing this repository (installed plugins stay)")
+      hotspot("z_row" .. n, L, y1, RR - PAD - rmw - 4, y2, it.open and "Close this" or "Open this")
+    else
+    if selected == it then fillRect(L, y1, RR, y2, P.sel) elseif i % 2 == 0 then fillRect(L, y1, RR, y2, P.panel) end
+    local dot = it.update and P.warn or (it.loaded and (it.enabled and P.on or P.off) or P.idle)
+    disc(L + PAD + ind, y1 + ROW_PAD + 3, L + PAD + ind + lh - 4, y1 + ROW_PAD + lh - 1, dot)
+    local ver = it.ver and ("v" .. it.ver) or (it.m and ("v" .. tostring(it.m.version)) or "")
+    if it.update then ver = "v" .. tostring(it.ver) .. " > v" .. tostring(it.m.version) end
+    local state = (not it.loaded and not it.outside) and "not loaded" or (it.outside and "link only" or (not it.enabled and "disabled" or ""))
+    -- buttons (right to left) only while the name and version columns keep their room
+    local bx = RR - PAD
+    for _, b in ipairs(rowButtons(it)) do
+      local bw = textW(FONT_S, b[4] or b[2]) + 12
+      if bx - bw > colV + 20 then
+        roundRect(bx - bw, y1 + 2, bx, y2 - 2, P.hot, P.edge)
+        text(FONT_S, b[2], bx - bw + math.floor((bw - textW(FONT_S, b[2])) / 2), y1 + ROW_PAD + 1, b[1] == "update" and P.warn or P.text)
+        hotspot("b_" .. b[1] .. "_" .. n, bx - bw, y1 + 2, bx, y2 - 2, b[3])
+        bx = bx - bw - 5
+      end
+    end
+    local nfont = (selected == it) and FONT_B or FONT                -- regular weight reads more easily; the picked row is bold
+    text(nfont, fit(nfont, it.name, math.min(colV, bx) - cName - ind - 8), cName + ind, y1 + ROW_PAD, P.text)
+    if bx - colV > 30 then text(FONT_S, fit(FONT_S, ver, math.min(colA, bx) - colV - 6), colV, y1 + ROW_PAD + 1, it.update and P.warn or P.muted) end
+    local au = author_of(it)
+    local aw = bx - colA - 8
+    if state ~= "" and aw > 140 then                                   -- room for the state word: the author keeps up to two thirds
+      local sw = textW(FONT_S, state)
+      local auw = math.min(textW(FONT_S, au), aw - sw - 14)
+      if auw >= 40 or au == "" then
+        if au ~= "" then text(FONT_S, fit(FONT_S, au, auw), colA, y1 + ROW_PAD + 1, P.text) end
+        text(FONT_S, state, bx - 8 - sw, y1 + ROW_PAD + 1, P.muted)
+      else state = "" end
+    end
+    if (state == "" or aw <= 140) and aw > 40 and au ~= "" then text(FONT_S, fit(FONT_S, au, aw), colA, y1 + ROW_PAD + 1, P.text) end
+    hotspot("z_row" .. n, L, y1, bx, y2, it.name)
+    end
+  end
+  if ok_sb then
+    if not sb then
+      sb = ScrollBar.new(WIN, "list", R - sbw + 1, listTop, R, listBottom)
+      sb:addUpdateCallback(nil, function(step) sb_step(step) end)
+    end
+    sb:setRect(R - sbw + 1, listTop, R, listBottom)
+    sb:setScroll(view.top + 1, visible, math.max(#shown, visible), true)
+    sb:draw(true)                                                    -- true: only paint, do not call back into this window
+  elseif #shown > visible then                                       -- no scroll bar library: a thin thumb on the right edge
+    local h = listBottom - listTop - 4
+    local th = math.max(14, math.floor(h * visible / #shown))
+    local ty = listTop + 2 + math.floor((h - th) * view.top / math.max(1, maxTop))
+    fillRect(R - 3, ty, R - 1, ty + th, P.edge)
+  end
+  -- footer text
+  local it = selected
+  local fy = listBottom + 5
+  if it then
+    local who = author_of(it)
+    local ver = it.ver and ("v" .. it.ver) or (it.m and ("v" .. tostring(it.m.version)) or "")
+    text(FONT_B, fit(FONT_B, it.name .. (ver ~= "" and ("   " .. ver) or "") .. (who ~= "" and ("   by " .. who) or ""), W - 2 * PAD), L + PAD, fy, P.text)
+    local pur = purpose_of(it)
+    if pur ~= "" then text(FONT, fit(FONT, pur, W - 2 * PAD), L + PAD, fy + lh, P.text)
+    else text(FONT, "(no purpose given)", L + PAD, fy + lh, P.muted) end
+    local detail = (it.file and it.file ~= "" and it.file) or (it.m and it.m.repo) or (it.o and (it.o.note or it.o.repo)) or ""
+    if it.src and not it.src.def then detail = "from " .. src_label(it.src) .. (detail ~= "" and ("   " .. detail) or "") end
+    local linkOk = (it.m and it.m.repo) or (it.o and it.o.repo)
+    local hasState = state_path(it) ~= nil
+    local alike = similar_loaded(it)
+    if alike and alike.self then alike = nil end
+    local y3 = fy + lh * 2
+    local rx2 = R - PAD
+    local function footBtn(label, id, tip)
+      local bw = textW(FONT_S, label) + 14
+      roundRect(rx2 - bw, y3 - 2, rx2, y3 + lh + 1, P.panel, P.edge)
+      text(FONT_S, label, rx2 - bw + 7, y3, P.idle)
+      hotspot(id, rx2 - bw, y3 - 2, rx2, y3 + lh + 1, tip)
+      rx2 = rx2 - bw - 5
+    end
+    if linkOk then footBtn("Repo", "b_repo", "Open the repository link in your browser") end
+    if it.loaded then
+      footBtn("Triggers", "b_triggers", "Show the triggers this plugin defines")
+      footBtn("Aliases", "b_aliases", "Show the aliases this plugin defines")
+    end
+    if hasState then footBtn("State file", "b_state", "Open the saved-state file in your editor") end
+    if alike then footBtn("Force install", "b_force", "This looks like " .. alike.name .. " (a fork?): back it up, take it out, and install this one in its place") end
+    if alike and not it.loaded then detail = "looks like your " .. alike.name .. "   " .. detail end
+    text(FONT_S, fit(FONT_S, detail, rx2 - L - PAD - 6), L + PAD, y3, P.muted)
+  else
+    local msg
+    if #sources == 0 then msg = "No manifest address yet: type  pm manifest https://...  or add a repository on the Store tab."
+    elseif last_err then msg = "Last check: " .. last_err
+    elseif checked_at > 0 then msg = "Checked " .. os.date("%H:%M", checked_at) .. ". Click a plugin for details."
+    else msg = "Press Check to read the manifest. Click a plugin for details." end
+    text(FONT_S, fit(FONT_S, msg, W - 2 * PAD), L + PAD, fy, P.muted)
+  end
+  win:dress_window("Plugins")
+end
+
+local lastErr
+local function repaint()
+  if BufferedRepaint then BufferedRepaint()
+  elseif IsPluginInstalled("abc1a0944ae4af7586ce88dc") then CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+  else Redraw() end
+end
+local function safeDraw()
+  local ok, err = pcall(draw)
+  if not ok and err ~= lastErr then lastErr = err; say("draw error: " .. tostring(err)) end
+  repaint()
+end
+sb_step = function(step)                                   -- the bar was dragged or an arrow clicked: step is the first visible row
+  view.top = math.max(0, (tonumber(step) or 1) - 1)
+  safeDraw()
+end
+function pm_redraw() if TW and WindowInfo(WIN, 1) then safeDraw() end end
+redraw_window = function() if TW and WindowInfo(WIN, 1) then safeDraw() end end
+
+local function ensureWindow()
+  if not ok_theme then say("The themed window library is not available; use the text commands (pm help)."); return false end
+  if TW and WindowInfo(WIN, 1) then return true end
+  added = {}; menuIdx = {}
+  TW = ThemedBasicWindow(WIN, 200, 140, 680, 400, "Plugins", "center", true, 1,
+    function() safeDraw() end, function() safeDraw(); DoAfterSpecial(0.1, "pm_redraw()", 12) end, function() TW = nil; added = {}; if sb then pcall(sb.unInit, sb) end; sb = nil; if not closing then SetVariable("visible", "0") end end,
+    fontName, fontHeight, true)
+  table.insert(TW.menu_table, "Check for updates"); table.insert(TW.menu_handlers, function() act_check(false) end)
+  table.insert(TW.menu_table, "Update everything that has an update"); table.insert(TW.menu_handlers, function() window_update_all() end)
+  table.insert(TW.menu_table, "Add a plugin file..."); table.insert(TW.menu_handlers, function() Execute("pm add") end)
+  table.insert(TW.menu_table, "Font..."); table.insert(TW.menu_handlers, function() Execute("pm font pick") end)
+  table.insert(TW.menu_table, "Save the world file"); table.insert(TW.menu_handlers, function() Execute("pm save") end)
+  table.insert(TW.menu_table, "Close"); table.insert(TW.menu_handlers, function() TW:hide(); SetVariable("visible", "0") end)
+  setupFonts()
+  return true
+end
+
+local function toggle_window(force)
+  if not ensureWindow() then return end
+  local on = force
+  if on == nil then on = not WindowInfo(WIN, 5) end
+  if on then refresh(); TW:show(); safeDraw(); for _, s in ipairs({ 0.1, 0.3, 1 }) do DoAfterSpecial(s, "pm_redraw()", 12) end
+  else TW:hide(); repaint() end
+  SetVariable("visible", on and "1" or "0")
+end
+
+function PM_wheel(flags)
+  view.top = view.top + ((bit.band(flags, 0x100) ~= 0) and 1 or -1)          -- 0x100 (miniwin.wheel_scroll_back) = scrolled down
+  if view.top < 0 then view.top = 0 end
+  safeDraw()
+end
+
+local function do_action(act, it)
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  if act == "reload" then act_reload(it)
+  elseif act == "enable" then act_enable(it, true)
+  elseif act == "disable" then act_enable(it, false)
+  elseif act == "update" or act == "install" then
+    if not it.m then say(it.name .. " is not in the manifest."); return end
+    if not confirm_outside(act, it) then return end
+    run_jobs({ it }, act)
+  elseif act == "remove" then
+    if it.self then return end
+    if confirm("Remove " .. it.name .. "?\n\nIt is taken out of MUSHclient. " .. basename(it.file or "") .. " and its saved data are not touched." ..
+         (it.group == "stock" and "\n\nThis plugin comes with the AardMUSHclient package; other plugins may need it." or "")) then act_remove(it) end
+  elseif act == "open" then act_open(it)
+  elseif act == "unload" then act_unload(it) end
+end
+
+function PM_click(flags, id)
+  if bit.band(flags, miniwin.hotspot_got_lh_mouse) == 0 then return end
+  local tab = id:match("^a_tab_(.+)$")
+  if tab then view.tab = tab; view.top = 0; selected, sel_key = nil, nil; safeDraw(); return end
+  if id == "b_check" then act_check(false); safeDraw(); return end
+  if id == "b_updall" then
+    window_update_all(); return
+  end
+  if id == "b_add" then
+    if busy then say("Wait for the " .. busy .. " to finish."); return end
+    local path = utils and utils.filepicker and utils.filepicker("Choose a plugin file", "", "xml", { xml = "MUSHclient plugin files", ["*"] = "All files" })
+    if path and path ~= "" then act_add(path) else say("pm add FILE   adds a plugin file you downloaded.") end
+    return
+  end
+  if id == "b_repos" then
+    if busy then say("Wait for the " .. busy .. " to finish."); return end
+    local choices = { "Add a repository...", "Check all sources now" }
+    local removable = {}
+    local seen_owner = {}
+    for _, src in ipairs(sources) do
+      if not src.def then
+        local ok2 = owner_key(src):lower()
+        if not seen_owner[ok2] then
+          seen_owner[ok2] = true
+          local n = #owner_sources(ok2)
+          local c = "Remove all of " .. owner_key(src) .. " (" .. n .. ")"
+          choices[#choices + 1] = c; removable[c] = ok2
+        end
+      end
+    end
+    local hx = tonumber(WindowHotspotInfo and WindowHotspotInfo(WIN, "b_repos", 1)) or 10
+    local hy = tonumber(WindowHotspotInfo and WindowHotspotInfo(WIN, "b_repos", 4)) or 30
+    local pick = WindowMenu(WIN, hx, hy, table.concat(choices, "|"))
+    if pick == "Add a repository..." then
+      local url = utils and utils.inputbox and utils.inputbox("Address of a GitHub repository (https://github.com/OWNER/REPO), a manifest (.json) or a plugin file (.xml):", "Add a repository", "")
+      if url and trim(url) ~= "" then
+        local u = normalize_source(url)
+        if kind_of(u) and confirm("Add " .. src_label({ url = u }) .. " as a source of plugins?\n\nPlugins from outside sources run inside MUSHclient. Nothing is installed without a click, but only add people you trust.") then
+          if act_add_source(u) then act_check(false) end
+        elseif not kind_of(u) then act_add_source(u) end
+      end
+    elseif pick == "Check all sources now" then act_check(false)
+    elseif removable[pick] then act_remove_owner(removable[pick]) end
+    safeDraw(); return
+  end
+  if id == "b_repo" then if selected then act_open(selected) end; return end
+  if id == "b_state" then if selected then act_state(selected) end; return end
+  if id == "b_force" then
+    if busy then say("Wait for the " .. busy .. " to finish."); return end
+    local old = selected and similar_loaded(selected)
+    if old and not old.self and confirm("Force install " .. selected.name .. " v" .. tostring(selected.m.version) .. " from " .. src_label(selected.src) .. "?\n\nIt looks like " .. old.name ..
+         " (" .. basename(old.file or "") .. "), which is installed now.\nThe current plugin is backed up (" .. basename(old.file or "") .. ".bak_DATE), taken out of MUSHclient, and the repository's version is installed in its place. " ..
+         "If the new one does not load, the old one is put back.\n\nThe file comes from " .. source_host(selected) .. ". Only continue if this is a fork of it and you trust that source." ..
+         (old.group == "stock" and "\n\nThe current plugin is part of the AardMUSHclient package." or "")) then act_force(selected) end
+    return
+  end
+  if id == "b_aliases" then if selected then act_listing(selected, "alias") end; return end
+  if id == "b_triggers" then if selected then act_listing(selected, "trigger") end; return end
+  local fg = id:match("^b_forget_(%d+)$")
+  if fg then
+    local row = shown[tonumber(fg)]
+    if not (row and row.header) then say("That row has changed; try again."); return end
+    if busy then say("Wait for the " .. busy .. " to finish."); return end
+    if row.header == "owner" then
+      local list = owner_sources(row.key)
+      if confirm("Stop listing " .. #list .. " repositor" .. (#list == 1 and "y" or "ies") .. " of " .. row.name .. "?\n\nPlugins you already installed from " .. (#list == 1 and "it" or "them") .. " stay installed; only the Store listing goes away.") then act_remove_owner(row.key) end
+    else
+      if confirm("Stop listing " .. src_label(row.src) .. "?\n\nPlugins you already installed from it stay installed; only the Store listing goes away.") then remove_sources({ row.src }, src_label(row.src)) end
+    end
+    selected, sel_key = nil, nil
+    safeDraw(); return
+  end
+  local act, n = id:match("^b_(%a+)_(%d+)$")
+  if act then
+    local row = shown[tonumber(n)]
+    local it = row and live(key_of(row))
+    if it then do_action(act, it) else say("That row has changed; try again.") end
+    return
+  end
+  local rn = id:match("^z_row(%d+)$")
+  if rn then
+    local row = shown[tonumber(rn)]
+    if row and row.header then                                       -- open this one, close the others on its level (a second click closes it)
+      if row.header == "owner" then SetVariable("store_owner", row.open and "#none" or row.key); SetVariable("store_open", "")
+      else SetVariable("store_open", row.open and "none" or row.src.url) end
+      selected, sel_key = nil, nil
+      safeDraw(); return
+    end
+    selected = row and live(key_of(row)); sel_key = selected and key_of(selected) or nil; safeDraw()
+  end
+end
+
+---------------------------------------------------------------------------
+-- The aliases / triggers window (same look as the manager's window)
+---------------------------------------------------------------------------
+local LWIN = "PluginManagerListWin"
+local LW, lw_sb = nil, nil
+local lw = { it = nil, kind = "alias", data = {}, top = 0, sel = nil }
+local lw_added = {}
+local LFONT, LFONT_B, LFONT_S = "pl_f", "pl_fb", "pl_fs"
+local lw_step
+
+local function lw_rows() return lw.data[lw.kind] or {} end
+local SIDE_W = 300                                         -- the side panel's width; the window grows by this much while one entry is open
+
+local function lw_set_side(on)                             -- the window widens to the right when an entry is opened, and narrows again when it is closed
+  on = on and true or false
+  if on == (lw.wide or false) then return end
+  lw.wide = on
+  if LW and LW.width then LW:resize(LW.width + (on and SIDE_W or -SIDE_W)) end
+end
+
+local function wrap_text(measure, s0, maxw)               -- lines no wider than maxw: breaks at spaces, and inside a word that is too long on its own
+  local out = {}
+  for para in (tostring(s0) .. "\n"):gmatch("(.-)\r?\n") do
+    if para == "" then out[#out + 1] = ""
+    else
+      local line = ""
+      for word in para:gmatch("%S+") do
+        local try = line == "" and word or (line .. " " .. word)
+        if measure(try) <= maxw then line = try
+        else
+          if line ~= "" then out[#out + 1] = line; line = "" end
+          while measure(word) > maxw and #word > 1 do
+            local k = #word
+            while k > 1 and measure(word:sub(1, k)) > maxw do k = k - 1 end
+            out[#out + 1] = word:sub(1, k); word = word:sub(k + 1)
+          end
+          line = word
+        end
+      end
+      if line ~= "" then out[#out + 1] = line end
+    end
+  end
+  return out
+end
+
+local function entry_text(r, kind)                         -- one entry, in plain text (Copy entry)
+  local out = { LISTING[kind].one .. ": " .. r.match, "enabled: " .. (r.on and "yes" or "no"), "regular expression: " .. (r.rx and "yes" or "no") }
+  if r.send then out[#out + 1] = "sends: " .. r.send end
+  if r.script then out[#out + 1] = "script: " .. r.script end
+  if r.group then out[#out + 1] = "group: " .. r.group end
+  return table.concat(out, "\r\n")
+end
+
+local function lw_draw()
+  local win = LW
+  if not win or not win.bodyleft or not lw.it then return end
+  local fname, fsize = font_spec()
+  WindowFont(LWIN, LFONT, fname, fsize, false); WindowFont(LWIN, LFONT_B, fname, fsize, true); WindowFont(LWIN, LFONT_S, fname, math.max(7, fsize - 1), false)
+  local lh = WindowFontInfo(LWIN, LFONT, 1) + 1
+  local P = palette()
+  for id in pairs(lw_added) do WindowDeleteHotspot(LWIN, id) end
+  lw_added = {}
+  win:blank()
+  local L, T, R, B = win.bodyleft, win.bodytop, win.bodyright, win.bodybottom
+  local rows = lw_rows()
+  local opened = lw.sel and rows[lw.sel]
+  local LR = opened and (R - SIDE_W) or R                  -- the list ends here; the side panel takes the rest while an entry is open
+  local W = LR - L + 1
+  local function tw(font, s) return WindowTextWidth(LWIN, font, s) end
+  local function tx(font, s, x, y, col) return WindowText(LWIN, font, s, x, y, 0, 0, col, false) end
+  local function fitw(font, s, maxw)
+    if maxw <= 0 then return "" end
+    if tw(font, s) <= maxw then return s end
+    while #s > 1 and tw(font, s .. "...") > maxw do s = s:sub(1, -2) end
+    return s .. "..."
+  end
+  local function pill(x1, y1, x2, y2, fill, edge) WindowCircleOp(LWIN, 3, x1, y1, x2, y2, edge or fill, 0, 1, fill, 0, 8, 8) end
+  local function hs(id, x1, y1, x2, y2, tip, wheel)
+    if WindowMoveHotspot(LWIN, id, x1, y1, x2, y2) ~= 0 then
+      WindowAddHotspot(LWIN, id, x1, y1, x2, y2, "", "", "", "", "LW_click", tip or "", 1, 0)
+      if wheel then WindowScrollwheelHandler(LWIN, id, "LW_wheel") end
+    end
+    lw_added[id] = true
+  end
+  -- top bar: one tab per kind on the left, Copy on the right of the list
+  local rx = LR - PAD
+  local cw = tw(LFONT_S, "Copy") + 14
+  pill(rx - cw, T + 5, rx, T + 3 + lh + 4, P.panel, P.edge); tx(LFONT_S, "Copy", rx - cw + 7, T + 7, P.text)
+  hs("lw_copy", rx - cw, T + 5, rx, T + 3 + lh + 4, "Put this list on the clipboard")
+  local cx = L + PAD
+  for _, k in ipairs({ "alias", "trigger" }) do
+    local label = LISTING[k].many .. " " .. #(lw.data[k] or {})
+    local w = tw(LFONT_S, label) + 14
+    local on = lw.kind == k
+    if cx + w < rx - cw - 6 then
+      pill(cx, T + 5, cx + w, T + 3 + lh + 4, on and P.sel or P.panel, on and P.idle or P.edge)
+      tx(LFONT_S, label, cx + 7, T + 7, on and P.text or P.muted)
+      hs("lw_tab_" .. k, cx, T + 5, cx + w, T + 3 + lh + 4, "Show the " .. LISTING[k].many:lower())
+      cx = cx + w + 4
+    end
+  end
+  local barH = lh + 12
+  WindowLine(LWIN, L, T + barH, LR, T + barH, P.edge, 0, 1)
+  local footH = lh + 10                                    -- one hint line
+  local listTop, listBottom = T + barH + 1, B - footH
+  WindowLine(LWIN, L, listBottom, LR, listBottom, P.edge, 0, 1)
+  local rowH = lh * 2 + ROW_PAD * 2 + 2
+  local visible = math.max(1, math.floor((listBottom - listTop) / rowH))
+  local maxTop = math.max(0, #rows - visible)
+  if lw.top > maxTop then lw.top = maxTop end
+  if lw.top < 0 then lw.top = 0 end
+  local sbw = ok_sb and (Theme.RESIZER_SIZE or 14) or 0
+  local RR = LR - sbw - (sbw > 0 and 1 or 0)
+  if #rows == 0 then tx(LFONT, "This plugin defines no " .. LISTING[lw.kind].many:lower() .. ".", L + PAD, listTop + PAD, P.muted) end
+  for i = 1, visible do
+    local n = lw.top + i
+    local r = rows[n]
+    if not r then break end
+    local y1 = listTop + (i - 1) * rowH
+    local y2 = y1 + rowH - 1
+    if lw.sel == n then WindowRectOp(LWIN, 2, L, y1, RR, y2, P.sel) elseif i % 2 == 0 then WindowRectOp(LWIN, 2, L, y1, RR, y2, P.panel) end
+    WindowCircleOp(LWIN, 1, L + PAD, y1 + ROW_PAD + 3, L + PAD + lh - 4, y1 + ROW_PAD + lh - 1, r.on and P.on or P.off, 0, 1, r.on and P.on or P.off, 0)
+    local x0 = L + PAD + lh + 4
+    if r.rx then
+      local bw = tw(LFONT_S, "rx") + 10
+      pill(x0, y1 + ROW_PAD, x0 + bw, y1 + ROW_PAD + lh, P.hot, P.edge); tx(LFONT_S, "rx", x0 + 5, y1 + ROW_PAD + 1, P.idle)
+      x0 = x0 + bw + 6
+    end
+    tx(lw.sel == n and LFONT_B or LFONT, fitw(LFONT, r.match, RR - PAD - x0), x0, y1 + ROW_PAD, r.on and P.text or P.muted)
+    local parts = {}                                       -- the second line is cut to the width of the list
+    if not r.on then parts[#parts + 1] = "off" end
+    if r.send then parts[#parts + 1] = "sends: " .. one_line(r.send, 200) end
+    if r.script then parts[#parts + 1] = "script: " .. r.script end
+    if r.group then parts[#parts + 1] = "group: " .. r.group end
+    local x1 = L + PAD + lh + 4
+    tx(LFONT_S, fitw(LFONT_S, table.concat(parts, "     "), RR - PAD - x1), x1, y1 + ROW_PAD + lh + 1, P.muted)
+    hs("lw_row" .. n, L, y1, RR, y2, "", true)               -- (hotspots are tried in name order: "lw_row.." comes before "lw_zlist", so the rows get the clicks)
+  end
+  hs("lw_zlist", L, listTop, LR, listBottom, "", true)
+  if ok_sb then
+    if not lw_sb then
+      lw_sb = ScrollBar.new(LWIN, "pmlist", LR - sbw + 1, listTop, LR, listBottom)
+      lw_sb:addUpdateCallback(nil, function(step) lw_step(step) end)
+    end
+    lw_sb:setRect(LR - sbw + 1, listTop, LR, listBottom)
+    lw_sb:setScroll(lw.top + 1, visible, math.max(#rows, visible), true)
+    lw_sb:draw(true)
+  end
+  tx(LFONT_S, fitw(LFONT_S, opened and "Click the entry again, or the x, to close the side panel." or "Click an entry to open it in a side panel. Copy puts the whole list on the clipboard.", W - 2 * PAD), L + PAD, listBottom + 5, P.muted)
+  -- the side panel: the opened entry in full
+  if opened then
+    local X1 = LR + 1
+    WindowRectOp(LWIN, 2, X1, T, R, B, P.panel)
+    WindowLine(LWIN, X1, T, X1, B, P.edge, 0, 1)
+    local px, pw = X1 + PAD, SIDE_W - 2 * PAD - 1
+    local y = T + 6
+    tx(LFONT_B, LISTING[lw.kind].one, px, y, P.text)
+    local st = opened.on and "enabled" or "disabled"
+    local stw = tw(LFONT_S, st) + 12
+    local xw = tw(LFONT_S, "x") + 14
+    pill(R - PAD - xw, y - 2, R - PAD, y + lh, P.hot, P.edge); tx(LFONT_S, "x", R - PAD - xw + 7, y, P.text)
+    hs("lw_close", R - PAD - xw, y - 2, R - PAD, y + lh, "Close the side panel")
+    pill(R - PAD - xw - 6 - stw, y - 2, R - PAD - xw - 6, y + lh, P.hot, P.edge); tx(LFONT_S, st, R - PAD - xw - 6 - stw + 6, y, opened.on and P.on or P.off)
+    y = y + lh + 8
+    local bottom = B - lh - 16                              -- room for the Copy entry button
+    local function section(label, value, col)
+      if y + lh > bottom then return end
+      tx(LFONT_S, label, px, y, P.muted); y = y + lh
+      for _, line in ipairs(wrap_text(function(t) return tw(LFONT, t) end, value, pw)) do
+        if y + lh > bottom then tx(LFONT_S, "...", px, y, P.muted); y = bottom; return end
+        tx(LFONT, line, px, y, col or P.text); y = y + lh
+      end
+      y = y + 6
+    end
+    section(opened.rx and "Match (regular expression)" or "Match", opened.match)
+    section("Sends", opened.send or "(it sends nothing itself)", opened.send and P.text or P.muted)
+    if opened.script then section("Script", opened.script) end
+    if opened.group then section("Group", opened.group) end
+    local bw2 = tw(LFONT_S, "Copy entry") + 14
+    pill(R - PAD - bw2, B - lh - 8, R - PAD, B - 5, P.panel, P.edge); tx(LFONT_S, "Copy entry", R - PAD - bw2 + 7, B - lh - 6, P.idle)
+    hs("lw_copyone", R - PAD - bw2, B - lh - 8, R - PAD, B - 5, "Put this entry on the clipboard")
+  end
+  win:dress_window(LISTING[lw.kind].many .. ": " .. lw.it.name)
+end
+local function lw_safedraw()
+  local ok, err = pcall(lw_draw)
+  if not ok then say("draw error: " .. tostring(err)) end
+  repaint()
+end
+lw_step = function(step) lw.top = math.max(0, (tonumber(step) or 1) - 1); lw_safedraw() end
+function pm_lw_redraw() if LW and WindowInfo(LWIN, 1) then lw_safedraw() end end
+
+function LW_wheel(flags)
+  lw.top = lw.top + ((bit.band(flags, 0x100) ~= 0) and 1 or -1)
+  if lw.top < 0 then lw.top = 0 end
+  lw_safedraw()
+end
+function LW_click(flags, id)
+  if bit.band(flags, miniwin.hotspot_got_lh_mouse) == 0 then return end
+  local k = id:match("^lw_tab_(%a+)$")
+  if k then lw.kind = k; lw.top = 0; lw.sel = nil; lw_set_side(false); lw_safedraw(); return end
+  if id == "lw_copy" then
+    local text = listing_text(lw.it, lw.kind, lw_rows())
+    if SetClipboard then SetClipboard(text); say("Copied the " .. LISTING[lw.kind].many:lower() .. " of " .. lw.it.name .. " to the clipboard.") else say("This client cannot copy to the clipboard.") end
+    return
+  end
+  if id == "lw_copyone" then
+    local r = lw.sel and lw_rows()[lw.sel]
+    if r and SetClipboard then SetClipboard(entry_text(r, lw.kind)); say("Copied the entry to the clipboard.") end
+    return
+  end
+  if id == "lw_close" then lw.sel = nil; lw_set_side(false); lw_safedraw(); return end
+  local n = id:match("^lw_row(%d+)$")
+  if n then
+    n = tonumber(n)
+    if lw.sel == n then lw.sel = nil; lw_set_side(false)       -- the same entry again: close the side panel
+    else lw.sel = n; lw_set_side(true) end
+    lw_safedraw()
+  end
+end
+
+open_listing_window = function(it, kind)
+  if not ok_theme then return false end
+  if not (LW and WindowInfo(LWIN, 1)) then
+    lw_added = {}
+    LW = ThemedBasicWindow(LWIN, 260, 170, 640, 420, "Aliases", "center", true, 1,
+      function() lw_safedraw() end, function() lw_safedraw(); DoAfterSpecial(0.1, "pm_lw_redraw()", 12) end,
+      function() LW = nil; lw.wide = false; lw_added = {}; if lw_sb then pcall(lw_sb.unInit, lw_sb) end; lw_sb = nil end,
+      fontName, fontHeight, true)
+    table.insert(LW.menu_table, "Font..."); table.insert(LW.menu_handlers, function() Execute("pm font pick") end)
+    table.insert(LW.menu_table, "Close"); table.insert(LW.menu_handlers, function() LW:hide() end)
+  end
+  lw_set_side(false)
+  lw.it, lw.kind, lw.top, lw.sel = it, kind, 0, nil
+  lw.data = { alias = read_listing(it, "alias") or {}, trigger = read_listing(it, "trigger") or {} }
+  LW:show(); lw_safedraw()
+  for _, t in ipairs({ 0.1, 0.3, 1 }) do DoAfterSpecial(t, "pm_lw_redraw()", 12) end
+  return true
+end
+
+---------------------------------------------------------------------------
+-- The checklist window for a GitHub user or organization (same look as the manager's window)
+---------------------------------------------------------------------------
+local OWIN = "PluginManagerOwnerWin"
+local OW, ow_sb = nil, nil
+local ow = { owner = "", repos = {}, top = 0, status = "" }
+local ow_added = {}
+local OFONT, OFONT_B, OFONT_S = "po_f", "po_fb", "po_fs"
+local ow_step
+
+local function ow_checked() local t = {}; for _, r in ipairs(ow.repos) do if r.checked then t[#t + 1] = r end end; return t end
+
+local function ow_draw()
+  local win = OW
+  if not win or not win.bodyleft then return end
+  local fname, fsize = font_spec()
+  WindowFont(OWIN, OFONT, fname, fsize, false); WindowFont(OWIN, OFONT_B, fname, fsize, true); WindowFont(OWIN, OFONT_S, fname, math.max(7, fsize - 1), false)
+  local lh = WindowFontInfo(OWIN, OFONT, 1) + 1
+  local P = palette()
+  for id in pairs(ow_added) do WindowDeleteHotspot(OWIN, id) end
+  ow_added = {}
+  win:blank()
+  local L, T, R, B = win.bodyleft, win.bodytop, win.bodyright, win.bodybottom
+  local W = R - L + 1
+  local function tw(font, s) return WindowTextWidth(OWIN, font, s) end
+  local function tx(font, s, x, y, col) return WindowText(OWIN, font, s, x, y, 0, 0, col, false) end
+  local function fitw(font, s, maxw)
+    if maxw <= 0 then return "" end
+    if tw(font, s) <= maxw then return s end
+    while #s > 1 and tw(font, s .. "...") > maxw do s = s:sub(1, -2) end
+    return s .. "..."
+  end
+  local function pill(x1, y1, x2, y2, fill, edge) WindowCircleOp(OWIN, 3, x1, y1, x2, y2, edge or fill, 0, 1, fill, 0, 8, 8) end
+  local function hs(id, x1, y1, x2, y2, tip, wheel)
+    if WindowMoveHotspot(OWIN, id, x1, y1, x2, y2) ~= 0 then
+      WindowAddHotspot(OWIN, id, x1, y1, x2, y2, "", "", "", "", "OW_click", tip or "", 1, 0)
+      if wheel then WindowScrollwheelHandler(OWIN, id, "OW_wheel") end
+    end
+    ow_added[id] = true
+  end
+  local nsel = #ow_checked()
+  -- top bar: buttons on the right (right to left), the owner's name and counts on the left
+  local rx = R - PAD
+  local function btn(id, label, tip, col)
+    local bw = tw(OFONT_S, label) + 14
+    if rx - bw < L + 120 then return end
+    pill(rx - bw, T + 5, rx, T + 3 + lh + 4, P.panel, P.edge); tx(OFONT_S, label, rx - bw + 7, T + 7, col or P.text)
+    hs(id, rx - bw, T + 5, rx, T + 3 + lh + 4, tip)
+    rx = rx - bw - 5
+  end
+  btn("ow_scan", "Look for plugins in all", "Look through every repository (not forks, archived or empty ones) for MUSHclient plugins and add the ones that have some", P.warn)
+  btn("ow_add", "Add selected" .. (nsel > 0 and (" (" .. nsel .. ")") or ""), "Add the selected repositories as sources", nsel > 0 and P.idle or P.muted)
+  btn("ow_none", "None", "Select none")
+  btn("ow_all", "All", "Select all")
+  tx(OFONT_B, fitw(OFONT_B, ow.owner .. "   " .. #ow.repos .. " repositories", rx - L - PAD * 2), L + PAD, T + 7, P.text)
+  local barH = lh + 12
+  WindowLine(OWIN, L, T + barH, R, T + barH, P.edge, 0, 1)
+  local footH = lh + 10
+  local listTop, listBottom = T + barH + 1, B - footH
+  WindowLine(OWIN, L, listBottom, R, listBottom, P.edge, 0, 1)
+  local rowH = lh * 2 + ROW_PAD * 2 + 2
+  local visible = math.max(1, math.floor((listBottom - listTop) / rowH))
+  local maxTop = math.max(0, #ow.repos - visible)
+  if ow.top > maxTop then ow.top = maxTop end
+  if ow.top < 0 then ow.top = 0 end
+  local sbw = ok_sb and (Theme.RESIZER_SIZE or 14) or 0
+  local RR = R - sbw - (sbw > 0 and 1 or 0)
+  for i = 1, visible do
+    local n = ow.top + i
+    local r = ow.repos[n]
+    if not r then break end
+    local y1 = listTop + (i - 1) * rowH
+    local y2 = y1 + rowH - 1
+    if r.checked then WindowRectOp(OWIN, 2, L, y1, RR, y2, P.sel) elseif i % 2 == 0 then WindowRectOp(OWIN, 2, L, y1, RR, y2, P.panel) end
+    local bx1, by1 = L + PAD, y1 + ROW_PAD + 2
+    WindowRectOp(OWIN, 2, bx1, by1, bx1 + lh - 4, by1 + lh - 4, r.checked and P.idle or P.bg)       -- the check box
+    WindowRectOp(OWIN, 1, bx1, by1, bx1 + lh - 4, by1 + lh - 4, P.edge)
+    if r.checked then tx(OFONT_S, "x", bx1 + 3, by1 - 1, P.text) end
+    local x0 = L + PAD + lh + 4
+    local tags = (r.fork and " fork" or "") .. (r.archived and " archived" or "") .. (r.empty and " empty" or "")
+    local dim = r.fork or r.archived or r.empty
+    tx(OFONT, fitw(OFONT, r.name, RR - PAD - x0 - (tags ~= "" and tw(OFONT_S, tags) + 8 or 0)), x0, y1 + ROW_PAD, dim and P.muted or P.text)
+    if tags ~= "" then tx(OFONT_S, tags, x0 + tw(OFONT, fitw(OFONT, r.name, RR - PAD - x0 - tw(OFONT_S, tags) - 8)) + 8, y1 + ROW_PAD + 1, P.warn) end
+    tx(OFONT_S, fitw(OFONT_S, (r.pushed ~= "" and (r.pushed .. "   ") or "") .. r.desc, RR - PAD - x0), x0, y1 + ROW_PAD + lh + 1, P.muted)
+    hs("ow_row" .. n, L, y1, RR, y2, r.url, true)
+  end
+  hs("ow_zlist", L, listTop, R, listBottom, "", true)
+  if ok_sb then
+    if not ow_sb then
+      ow_sb = ScrollBar.new(OWIN, "powner", R - sbw + 1, listTop, R, listBottom)
+      ow_sb:addUpdateCallback(nil, function(step) ow_step(step) end)
+    end
+    ow_sb:setRect(R - sbw + 1, listTop, R, listBottom)
+    ow_sb:setScroll(ow.top + 1, visible, math.max(#ow.repos, visible), true)
+    ow_sb:draw(true)
+  end
+  local msg = ow.status ~= "" and ow.status or "Select repositories and press Add selected, or let the manager look through all of them for plugins."
+  tx(OFONT_S, fitw(OFONT_S, msg, W - 2 * PAD), L + PAD, listBottom + 5, ow.status ~= "" and P.warn or P.muted)
+  win:dress_window("Repositories of " .. ow.owner)
+end
+local function ow_safedraw()
+  local ok, err = pcall(ow_draw)
+  if not ok then say("draw error: " .. tostring(err)) end
+  repaint()
+end
+ow_step = function(step) ow.top = math.max(0, (tonumber(step) or 1) - 1); ow_safedraw() end
+function pm_ow_redraw() if OW and WindowInfo(OWIN, 1) then ow_safedraw() end end
+function OW_wheel(flags)
+  ow.top = ow.top + ((bit.band(flags, 0x100) ~= 0) and 1 or -1)
+  if ow.top < 0 then ow.top = 0 end
+  ow_safedraw()
+end
+function OW_click(flags, id)
+  if bit.band(flags, miniwin.hotspot_got_lh_mouse) == 0 then return end
+  if id == "ow_all" then for _, r in ipairs(ow.repos) do r.checked = true end; ow_safedraw(); return end
+  if id == "ow_none" then for _, r in ipairs(ow.repos) do r.checked = false end; ow_safedraw(); return end
+  local n = id:match("^ow_row(%d+)$")
+  if n then local r = ow.repos[tonumber(n)]; if r then r.checked = not r.checked end; ow_safedraw(); return end
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  if id == "ow_add" then
+    local sel = ow_checked()
+    if #sel == 0 then ow.status = "Nothing is selected."; ow_safedraw(); return end
+    if not confirm("Add " .. #sel .. " repositor" .. (#sel == 1 and "y" or "ies") .. " of " .. ow.owner .. " as sources of plugins?\n\nPlugins from outside sources run inside MUSHclient. Nothing is installed without a click, but only add people you trust." ..
+         (#sel > 25 and "\n\nReading that many repositories uses a lot of GitHub requests (60 an hour without an account); some may fail until later." or "")) then return end
+    local urls = {}
+    for _, r in ipairs(sel) do urls[#urls + 1] = r.url end
+    local n2 = add_repo_sources(urls)
+    ow.status = n2 .. " added" .. ((#urls - n2) > 0 and (", " .. (#urls - n2) .. " were already listed") or "") .. ". Reading them..."
+    for _, r in ipairs(ow.repos) do r.checked = false end
+    ow_safedraw()
+    act_check(false, function(ok2, problem)
+      ow.status = ok2 and ("Done: see the Store tab." .. (problem and ("  Not everything could be read: " .. tostring(problem)) or "")) or ("Could not be read: " .. tostring(problem))
+      if OW then ow_safedraw() end
+    end)
+    return
+  end
+  if id == "ow_scan" then
+    local list = scannable(ow.repos)
+    if #list == 0 then ow.status = "Nothing to look at: the rest are forks, archived, empty or already listed."; ow_safedraw(); return end
+    if not confirm("Look through " .. math.min(#list, SCAN_MAX) .. " repositories of " .. ow.owner .. " for MUSHclient plugins?\n\nForks, archived and empty repositories are skipped. The ones that contain plugins are added as sources." ..
+         "\nThis uses one GitHub request per repository (60 an hour without an account)" .. (#list > SCAN_MAX and (", so only the first " .. SCAN_MAX .. " are looked at.") or ".")) then return end
+    scan_repos(ow.owner, list, function(m) ow.status = m; ow_safedraw() end, function(n, problem)
+      ow.status = "Found plugins in " .. n .. " repositor" .. (n == 1 and "y" or "ies") .. "; see the Store tab." .. (problem and ("  " .. problem) or "")
+      say("Found plugins in " .. n .. " repositor" .. (n == 1 and "y" or "ies") .. " of " .. ow.owner .. "." .. (problem and ("  " .. problem) or ""))
+      ow_safedraw()
+    end)
+  end
+end
+
+open_owner_window = function(owner, repos, partial)
+  if not ok_theme then return false end
+  if not (OW and WindowInfo(OWIN, 1)) then
+    ow_added = {}
+    OW = ThemedBasicWindow(OWIN, 280, 150, 620, 420, "Repositories", "center", true, 1,
+      function() ow_safedraw() end, function() ow_safedraw(); DoAfterSpecial(0.1, "pm_ow_redraw()", 12) end,
+      function() OW = nil; ow_added = {}; if ow_sb then pcall(ow_sb.unInit, ow_sb) end; ow_sb = nil end,
+      fontName, fontHeight, true)
+    table.insert(OW.menu_table, "Close"); table.insert(OW.menu_handlers, function() OW:hide() end)
+  end
+  ow.owner, ow.repos, ow.top, ow.status = owner, repos, 0, partial and ("Note: " .. partial) or ""
+  OW:show(); ow_safedraw()
+  for _, t in ipairs({ 0.1, 0.3, 1 }) do DoAfterSpecial(t, "pm_ow_redraw()", 12) end
+  return true
+end
+
+---------------------------------------------------------------------------
+-- Commands
+---------------------------------------------------------------------------
+local function help_text()
+  local d = GetPluginInfo(SELF, 3) or ""
+  for line in (d .. "\n"):gmatch("(.-)\n") do ColourNote("silver", "", line) end
+end
+
+function pm_command(name, line, wildcards)
+  local arg = trim(wildcards[1] or "")
+  local cmd, rest = arg:match("^(%S+)%s*(.*)$")
+  cmd = (cmd or ""):lower()
+  if cmd == "" or cmd == "window" then toggle_window(); return end
+  if cmd == "help" or cmd == "?" then help_text(); return end
+  if cmd == "list" or cmd == "ls" then
+    local which = rest:lower(); if which == "" then which = "all" end
+    if not FILTERS[which] then say("List which? crowley, stock, other, store, links, updates or all."); return end
+    print_list(which); return
+  end
+  if cmd == "check" then act_check(false); return end
+  if cmd == "source" or cmd == "sources" or cmd == "repo" then
+    local sub, arg2 = rest:match("^(%S+)%s*(.*)$")
+    sub = (sub or ""):lower()
+    if sub == "add" then
+      if arg2 == "" then say("pm source add URL   (a GitHub repository, a manifest .json or a plugin .xml, https only)"); return end
+      if act_add_source(arg2) then act_check(false) end
+    elseif sub == "scan" then
+      local o = owner_of(normalize_source(arg2))
+      if not o then say("pm source scan URL   (a GitHub user or organization, for example https://github.com/AardPlugins)"); return end
+      act_add_owner(o, true)
+    elseif sub == "remove" or sub == "rm" or sub == "delete" then act_remove_source(arg2)
+    else
+      say("Where plugins are offered from:")
+      local n = 0
+      for _, src in ipairs(sources) do
+        local tag
+        if src.def then tag = "main"
+        else n = n + 1; tag = tostring(n) end
+        local info = src.err and ("   (last read failed: " .. src.err .. ")") or (src.data and ("   " .. #src.data.plugins .. " plugin(s)" .. (src.note and (", " .. src.note) or "")) or "   (not read yet: pm check)")
+        ColourNote("gray", "", string.format("  %-5s", tag), "white", "", src_label(src), "gray", "", info)
+      end
+      if #sources == 0 then say("  (none: pm manifest https://...   or   pm source add URL)") end
+      say("pm source add URL  /  pm source remove N")
+    end
+    return
+  end
+  if cmd == "font" then
+    local name, size = font_spec()
+    if rest == "" then say("Window font: " .. name .. " " .. size .. (var("font_name", "") == "" and "   (the world's output font; pm font NAME [SIZE] changes it, pm font reset goes back)" or "   (pm font reset goes back to the output font)")); return end
+    if rest:lower() == "reset" then SetVariable("font_name", ""); SetVariable("font_size", ""); SaveState(); say("Window font: back to the output font."); redraw_window(); return end
+    if rest:lower() == "pick" then
+      local r = utils and utils.fontpicker and utils.fontpicker(name, size)
+      local pn, ps
+      if type(r) == "table" then pn, ps = r.name, r.size elseif type(r) == "string" then pn = r end
+      if not pn or pn == "" then return end
+      rest = pn .. " " .. tostring(ps or size)
+    end
+    local fname, fsize = rest:match("^(.-)%s+(%d+)$")
+    if not fname then fname = rest end
+    fname = trim(fname)
+    if fname == "" or #fname > 60 or fname:find("[%c\"|]") then say("pm font NAME [SIZE]   for example  pm font Segoe UI 11"); return end
+    if fsize and (tonumber(fsize) < 6 or tonumber(fsize) > 40) then say("The size should be between 6 and 40."); return end
+    SetVariable("font_name", fname)
+    if fsize then SetVariable("font_size", fsize) end
+    SaveState()
+    say("Window font: " .. fname .. " " .. (fsize or var("font_size", tostring(fontHeight))))
+    redraw_window(); pm_lw_redraw(); return
+  end
+  if cmd == "add" then
+    if busy then say("Wait for the " .. busy .. " to finish."); return end
+    if rest == "" then
+      local path = utils and utils.filepicker and utils.filepicker("Choose a plugin file", "", "xml", { xml = "MUSHclient plugin files", ["*"] = "All files" })
+      if path and path ~= "" then act_add(path) else say("pm add FILE   adds a plugin file you downloaded.") end
+    else act_add(rest) end
+    return
+  end
+  local CHANGES = { reload = true, unload = true, remove = true, rollback = true, load = true, update = true, install = true, enable = true, disable = true }
+  if busy and CHANGES[cmd] then say("Wait for the " .. busy .. " to finish."); return end
+  if cmd == "manifest" then
+    local reset = rest:lower() == "reset"                              -- back to the built-in address (if there is one)
+    if reset then rest = "" end
+    if busy and (rest ~= "" or reset) then say("Wait for the " .. busy .. " to finish."); return end
+    if rest ~= "" or reset then
+      if rest ~= "" and not rest:match("^https://") then say("The manifest address must start with https://"); return end
+      if sources[1] and sources[1].def then drop_cache(sources[1]) end
+      SetVariable("manifest", rest)
+      checked_at = 0                                                  -- what was read from the old address no longer counts
+      SetVariable("manifest_at", "0")
+      sources = {}                                                    -- (the other sources are read again from their cache files)
+      build_sources()
+      after_change()
+      say(rest ~= "" and "Manifest address saved. Run  pm check  to read it." or "Manifest address cleared.")
+    else
+      local cur = var("manifest", DEFAULT_MANIFEST)
+      say("Manifest: " .. (cur == "" and "(not set)   pm manifest https://..." or cur))
+    end
+    return
+  end
+  if cmd == "dir" then
+    if rest ~= "" then SetVariable("dir", rest); say("New plugins are installed into " .. install_dir())
+    else say("New plugins are installed into " .. install_dir() .. "   (pm dir FOLDER changes it)") end
+    return
+  end
+  if cmd == "auto" then
+    local r = rest:lower()
+    if r == "on" or r == "off" then SetVariable("auto", r) end
+    say("Daily check of the manifest: " .. var("auto", "on")); return
+  end
+  if cmd == "save" then
+    local ok, rc = pcall(Save)
+    -- Save answers false when it worked
+    if ok and (rc == false or rc == nil or rc == 0) then say("World file saved.") else say("Could not save the world file from here; use File > Save world in MUSHclient.") end
+    return
+  end
+  if cmd == "load" then
+    if rest == "" then say("pm load FILE   (a path, or a file name in the plugins folder)"); return end
+    local path = rest
+    if not path:match("^%a:[\\/]") and not path:match("^[\\/]") then path = (GetInfo(60) or "") .. path end
+    local rc = LoadPlugin(path)
+    if rc ~= 0 then say("Could not load " .. path .. ": " .. rc_text(rc)) else say("Loaded " .. path .. "  (pm save keeps it loaded next time)") end
+    after_change(); return
+  end
+  -- everything below acts on one plugin
+  if #items == 0 then refresh() end
+  if cmd == "update" and rest:lower() == "all" then
+    local list = {}
+    for _, it in ipairs(items) do if it.update then list[#list + 1] = it end end
+    if #list == 0 then say("No updates are waiting. (pm check asks the manifest again.)"); return end
+    run_jobs(list, "update"); return
+  end
+  local it, why = find(rest)
+  if not it then say(why); return end
+  if cmd == "reload" then act_reload(it)
+  elseif cmd == "unload" then act_unload(it)
+  elseif cmd == "enable" then act_enable(it, true)
+  elseif cmd == "disable" then act_enable(it, false)
+  elseif cmd == "info" then act_info(it)
+  elseif cmd == "open" then act_open(it)
+  elseif cmd == "state" then act_state(it)
+  elseif cmd == "force" then act_force(it)
+  elseif cmd == "aliases" or cmd == "alias" then act_listing(it, "alias")
+  elseif cmd == "triggers" or cmd == "trigger" then act_listing(it, "trigger")
+  elseif cmd == "update" or cmd == "install" then
+    if not it.m then say(it.name .. " is not in the manifest. (pm check reads it; outside packages are links only: pm open)"); return end
+    if cmd == "update" and not it.loaded then say(it.name .. " is not loaded: use  pm install  instead."); return end
+    if cmd == "install" and it.loaded then say(it.name .. " is already loaded: use  pm update  to get a newer version."); return end
+    if cmd == "update" and not it.update then say(it.name .. " is already up to date (v" .. tostring(it.ver) .. ")."); return end
+    run_jobs({ it }, cmd)
+  elseif cmd == "remove" then act_remove(it)
+  elseif cmd == "rollback" then
+    local main, rwhy = undo_files(it)
+    if not main then say(rwhy); return end
+    if it.loaded then
+      say("The previous file is back; reloading " .. it.name .. "...")
+      act_reload(it)
+    else say("The old file is back at " .. main .. ".") end
+    after_change()
+  else
+    say("Unknown command. pm help lists them.")
+  end
+end
+
+---------------------------------------------------------------------------
+-- Plugin events
+---------------------------------------------------------------------------
+function OnPluginInstall()
+  build_sources()
+  refresh()
+  if var("visible", "0") == "1" then DoAfterSpecial(1, "pm_show_window()", 12) end
+  DoAfterSpecial(8, "pm_autocheck()", 12)
+end
+function pm_show_window() toggle_window(true) end
+function OnPluginListChanged() refresh(); redraw_window() end
+function OnPluginClose() closing = true; if TW then pcall(function() TW:hide() end) end; if LW then pcall(function() LW:hide() end) end; if OW then pcall(function() OW:hide() end) end end
+
+-- for the tests
+PmTest = { items = function() return items end, shown = function() return shown end, listed = function() return listed end, manifest = main_data, sources = function() return sources end, view = view, draw = draw, find = find,
+           parse = parse_manifest, refresh = refresh, owner = owner_of, forget_cache = function() cache = nil end, standard = H.is_standard_file, relok = H.rel_ok, kind = function(u) return kind_of(normalize_source(u)) end }
+]]>
+</script>
+</muclient>
