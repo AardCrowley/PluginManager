@@ -10,7 +10,7 @@
    save_state="y"
    date_written="2026-11-14 12:00:00"
    requires="5.07"
-   version="2.7"
+   version="2.8"
    sequence="-50"
    >
 <description trim="y">
@@ -144,7 +144,7 @@ for f in ([[aard_requirements.xml aard_text_substitution.xml aard_prompt_fixer.x
 --     "outside": [ { "name", "repo", "id" (optional), "note" } ] }
 ---------------------------------------------------------------------------
 local OWNER = "Crowley"                    -- the tab and the group of the plugins that come from the main manifest (and of plugins whose author is OWNER)
-local DEFAULT_MANIFEST = "https://github.com/AardCrowley/PluginManager/blob/main/manifest.json"
+local DEFAULT_MANIFEST = "https://raw.githubusercontent.com/AardCrowley/PluginManager/main/manifest.json"                -- address of the main manifest. "pm manifest URL" overrides it.
 local sources = {}                         -- where plugins are offered from: [1] is the main manifest, the rest are repositories the player added
                                            --   { url, kind = "manifest" | "repo" | "file", def = true (main one), data = parsed manifest or nil, err = why the last read failed }
 local checked_at = tonumber(var("manifest_at", "0")) or 0
@@ -365,7 +365,7 @@ local function build_sources()                              -- from the saved se
     end
     sources[#sources + 1] = s
   end
-  local d = var("manifest", DEFAULT_MANIFEST)
+  local d = normalize_source(var("manifest", DEFAULT_MANIFEST))          -- a link to the file on github.com (".../blob/main/...") is read as the raw file
   if d ~= "" then add(d, "manifest", true) end
   for line in (var("sources", "") .. "\n"):gmatch("(.-)\n") do
     line = trim(line)
@@ -449,6 +449,7 @@ local function refresh()
       local mv, iv = vernum(it.m.version), vernum(it.ver)
       it.update = (it.loaded and mv and iv and mv > iv) and true or false
       it.ahead = (it.loaded and mv and iv and iv > mv) and true or false
+      it.changed = (it.loaded and not it.update and not it.ahead and H.differs(it)) and true or false     -- same version, but not the file the source offers
     end
     it.group = it.outside and "other" or group_of(it)          -- link-only entries (the manifest's "outside" list) sit under Other with the rest
   end
@@ -462,6 +463,12 @@ end
 
 local function live(key)                                      -- the current row for a key (rows are rebuilt on every refresh)
   for _, it in ipairs(items) do if key_of(it) == key then return it end end
+end
+
+local function changed_count()
+  local n = 0
+  for _, it in ipairs(items) do if it.changed then n = n + 1 end end
+  return n
 end
 
 local function updates_count()
@@ -517,7 +524,7 @@ local function build_shown(tab)
     local per, nplug, nups, nerr, firsterr = {}, 0, 0, 0, nil
     for _, src in ipairs(g.srcs) do
       local mine = {}
-      for _, it in ipairs(rows) do if it.src == src then mine[#mine + 1] = it; nplug = nplug + 1; if it.update then nups = nups + 1 end end end
+      for _, it in ipairs(rows) do if it.src == src then mine[#mine + 1] = it; nplug = nplug + 1; if it.update or it.changed then nups = nups + 1 end end end
       per[src] = mine
       if src.err then nerr = nerr + 1; firsterr = firsterr or src.err end
     end
@@ -534,7 +541,7 @@ local function build_shown(tab)
         end
         for _, src in ipairs(g.srcs) do
           local mine, ups = per[src], 0
-          for _, it in ipairs(mine) do if it.update then ups = ups + 1 end end
+          for _, it in ipairs(mine) do if it.update or it.changed then ups = ups + 1 end end
           local h = { header = "repo", src = src, name = repo_part(src, g.name), open = (ropen == src), count = #mine, ups = ups, err = src.err }
           out[#out + 1] = h; shown_indent[h] = 16
           if h.open then for _, it in ipairs(mine) do out[#out + 1] = it; shown_indent[it] = 32 end end
@@ -708,7 +715,7 @@ local function act_info(it)
   row("file", it.file)
   if it.src then row("source", src_label(it.src) .. (it.src.def and "  (main manifest)" or "  (" .. it.src.url .. ")")) end
   if it.m then
-    row("offered", "v" .. tostring(it.m.version) .. (it.update and "  (newer than yours)" or it.ahead and "  (yours is newer)" or ""))
+    row("offered", "v" .. tostring(it.m.version) .. (it.update and "  (newer than yours)" or it.ahead and "  (yours is newer)" or it.changed and "  (same version, but the file differs from yours: changes detected)" or ""))
     row("repository", it.m.repo); row("changes", it.m.changes)
   end
   if it.o then row("repository", it.o.repo); row("note", it.o.note) end
@@ -756,6 +763,23 @@ local function sha_ok(body, want)
   if not (utils and utils.sha256) then return false, "this client cannot compute the checksum" end
   if sha_hex(body) == want:lower() then return true end
   return false, "checksum does not match (the file is not the one the manifest describes)"
+end
+
+-- the installed file against the checksum the source lists: a difference at the same version means the author changed the file without raising the version.
+-- Only local files are read (nothing is downloaded). Line endings are ignored, since a copy saved by another tool may have them changed.
+function H.differs(it)
+  local want = it.m and it.m.sha256
+  if type(want) ~= "string" or want == "" or not it.file or not (utils and utils.sha256) then return false end
+  local body = readfile(it.file)
+  if not body or body == "" then return false end
+  want = want:lower()
+  local lf = body:gsub("\r\n", "\n")
+  local crlf = lf:gsub("\n", "\r\n")
+  for _, b in ipairs({ body, lf, crlf }) do
+    local ok, h = pcall(sha_hex, b)
+    if ok and h == want then return false end
+  end
+  return true
 end
 
 -- is this text the plugin the manifest entry says it is, complete, and does its script compile?
@@ -1205,9 +1229,10 @@ local function act_check(quiet, finished)               -- finished(ok, problem)
       after_change(); return
     end
     if why and not quiet then say("Not everything could be read: " .. tostring(why)) end
-    local n = updates_count()
-    if n > 0 then say(n .. " update" .. (n == 1 and "" or "s") .. " available:  pm list updates   (pm update all installs them)")
-    elseif not quiet then say("Everything listed is up to date.") end
+    local n, c = updates_count(), changed_count()
+    if n > 0 then say(n .. " update" .. (n == 1 and "" or "s") .. " available:  pm list updates   (pm update all installs them)") end
+    if c > 0 then say(c .. " plugin" .. (c == 1 and " has" or "s have") .. " changes detected: the file offered is not the one you have, though the version is the same (pm update NAME gets it)") end
+    if n == 0 and c == 0 and not quiet then say("Everything listed is up to date.") end
     after_change()
   end)
 end
@@ -1591,16 +1616,16 @@ local function print_list(which)
       ColourNote("silver", "", "")
       ColourNote("silver", "", (it.group == "mine" and OWNER or it.group == "stock" and "Stock (AardMUSHclient package)" or it.group == "other" and "Other" or it.group == "store" and "Store (from the repositories you added)" or "Outside packages (links only)"))
     end
-    local col = it.update and "orange" or (it.loaded and (it.enabled and "lime" or "gray") or "silver")
+    local col = (it.update or it.changed) and "orange" or (it.loaded and (it.enabled and "lime" or "gray") or "silver")
     ColourTell("gray", "", string.format("%3d  ", n))
     ColourTell(col, "", string.format("%-30s", it.name:sub(1, 30)))
     local ver = it.ver and ("v" .. it.ver) or (it.m and ("v" .. tostring(it.m.version)) or "")
     ColourTell("silver", "", string.format("%-8s", ver))
-    local state = it.update and ("-> v" .. tostring(it.m.version)) or (it.outside and "link only" or (not it.loaded and "not loaded") or (not it.enabled and "disabled") or (it.ahead and "newer than server") or "")
-    ColourTell(it.update and "orange" or "gray", "", string.format("%-18s", state))
+    local state = it.update and ("-> v" .. tostring(it.m.version)) or (it.outside and "link only" or (not it.loaded and "not loaded") or (not it.enabled and "disabled") or (it.changed and "changes detected") or (it.ahead and "newer than server") or "")
+    ColourTell((it.update or it.changed) and "orange" or "gray", "", string.format("%-18s", state))
     if it.loaded then
       link("reload " .. n, "[reload]"); link((it.enabled and "disable " or "enable ") .. n, it.enabled and "[disable]" or "[enable]")
-      if it.update then link("update " .. n, "[update]") end
+      if it.update or it.changed then link("update " .. n, "[update]") end
       if not it.self then link("remove " .. n, "[remove]", "Uninstall it from MUSHclient (its file and data stay)") end
     elseif it.m then link("install " .. n, "[install]") end
     if (it.m and it.m.repo) or (it.o and it.o.repo) then link("open " .. n, "[repo]", "Open the repository link") end
@@ -1685,7 +1710,7 @@ local TAB_ORDER = { "mine", "stock", "other", "store", "all" }
 local function rowButtons(it)                              -- the buttons a row gets, right to left
   local b = {}
   if it.loaded then
-    if it.update then b[#b + 1] = { "update", "Update", "Download v" .. tostring(it.m and it.m.version) .. ", keep the old file, reload it" } end
+    if it.update or it.changed then b[#b + 1] = { "update", "Update", it.changed and "Changes detected: the file offered differs from yours (same version). Download it, keep the old file, reload it" or ("Download v" .. tostring(it.m and it.m.version) .. ", keep the old file, reload it") } end
     if not it.self then b[#b + 1] = { it.enabled and "disable" or "enable", it.enabled and "Off" or "On", it.enabled and "Disable this plugin" or "Enable this plugin", "Off" } end   -- 4th: the label the width is taken from
     b[#b + 1] = { "reload", "Reload", "Reload this plugin" }
     if not it.self then b[#b + 1] = { "remove", "Remove", "Uninstall it from MUSHclient (its file and data stay)" } end
@@ -1718,7 +1743,7 @@ local function draw()
   bigButton(busy and "Working..." or "Check", "b_check", "Read the manifest and the repositories, and mark plugins that have a newer version", busy and P.warn or nil)
   if updates_count() > 0 then bigButton("Update all", "b_updall", "Install every update that is waiting", P.warn) end
   bigButton("Add", "b_add", "Add a plugin file you downloaded yourself")
-  if view.tab == "store" then bigButton("Repos", "b_repos", "Add or remove a repository plugins are listed from") end
+  if view.tab == "store" then bigButton("Repos", "b_repos", "Add a repository, or check the sources again (remove one with the button on its header)") end
   local cx = L + PAD
   for _, name in ipairs(TAB_ORDER) do
     local label = TAB_LABEL[name]
@@ -1757,7 +1782,7 @@ local function draw()
     if view.tab == "store" then
       local extra = 0
       for _, sx in ipairs(sources) do if not sx.def then extra = extra + 1 end end
-      if extra == 0 then none = "No repositories yet. Press Repos > Add a repository (a GitHub address), or type  pm source add https://github.com/OWNER/REPO"
+      if extra == 0 then none = "No repositories yet. Press Repos > Add repository (a GitHub address), or type  pm source add https://github.com/OWNER/REPO"
       else none = "Nothing found in the repositories yet. Press Check." end
     end
     text(FONT, fit(FONT, none, W - 2 * PAD - sbw), L + PAD, listTop + PAD, P.muted)
@@ -1773,7 +1798,7 @@ local function draw()
       fillRect(L, y1, RR, y2, it.header == "owner" and P.hot or P.panel)
       text(FONT_B, it.open and "v" or ">", L + PAD + ind, y1 + ROW_PAD, P.idle)
       local rmlabel = (it.header == "owner" and it.repos > 1) and "Remove repos" or "Remove repo"
-      local rmw = textW(FONT_S, rmlabel) + 14                           -- the button at the right end of the header
+      local rmw = textW(FONT_S, "Remove repos") + 14                           -- the button at the right end of the header
       local label = fit(FONT_B, it.name, RR - L - 260 - ind - rmw)
       text(it.header == "owner" and FONT_B or FONT, label, cName + ind, y1 + ROW_PAD, P.text)
       local lx = cName + ind + textW(FONT_B, label) + 10
@@ -1787,16 +1812,16 @@ local function draw()
       elseif bad then info = info .. "   (" .. (it.repos == 1 and ("could not be read: " .. it.err) or (it.nerr .. " could not be read")) .. ")" end
       text(FONT_S, fit(FONT_S, info, RR - lx - PAD - rmw - 6), lx, y1 + ROW_PAD + 1, (bad or (it.header == "repo" and it.err) or it.ups > 0) and P.warn or P.muted)
       roundRect(RR - PAD - rmw, y1 + 2, RR - PAD, y2 - 2, P.hot, P.edge)
-      text(FONT_S, rmlabel, RR - PAD - rmw + 7, y1 + ROW_PAD + 1, P.text)
+      text(FONT_S, rmlabel, RR - PAD - rmw + math.floor((rmw - textW(FONT_S, rmlabel)) / 2), y1 + ROW_PAD + 1, P.text)
       hotspot("b_forget_" .. n, RR - PAD - rmw, y1 + 2, RR - PAD, y2 - 2, it.header == "owner" and "Stop listing everything from this owner (installed plugins stay)" or "Stop listing this repository (installed plugins stay)")
       hotspot("z_row" .. n, L, y1, RR - PAD - rmw - 4, y2, it.open and "Close this" or "Open this")
     else
     if selected == it then fillRect(L, y1, RR, y2, P.sel) elseif i % 2 == 0 then fillRect(L, y1, RR, y2, P.panel) end
-    local dot = it.update and P.warn or (it.loaded and (it.enabled and P.on or P.off) or P.idle)
+    local dot = (it.update or it.changed) and P.warn or (it.loaded and (it.enabled and P.on or P.off) or P.idle)
     disc(L + PAD + ind, y1 + ROW_PAD + 3, L + PAD + ind + lh - 4, y1 + ROW_PAD + lh - 1, dot)
     local ver = it.ver and ("v" .. it.ver) or (it.m and ("v" .. tostring(it.m.version)) or "")
     if it.update then ver = "v" .. tostring(it.ver) .. " > v" .. tostring(it.m.version) end
-    local state = (not it.loaded and not it.outside) and "not loaded" or (it.outside and "link only" or (not it.enabled and "disabled" or ""))
+    local state = (not it.loaded and not it.outside) and "not loaded" or (it.outside and "link only" or (it.changed and "changes detected") or (not it.enabled and "disabled" or ""))
     -- buttons (right to left) only while the name and version columns keep their room
     local bx = RR - PAD
     for _, b in ipairs(rowButtons(it)) do
@@ -1967,24 +1992,11 @@ function PM_click(flags, id)
   end
   if id == "b_repos" then
     if busy then say("Wait for the " .. busy .. " to finish."); return end
-    local choices = { "Add a repository...", "Check all sources now" }
-    local removable = {}
-    local seen_owner = {}
-    for _, src in ipairs(sources) do
-      if not src.def then
-        local ok2 = owner_key(src):lower()
-        if not seen_owner[ok2] then
-          seen_owner[ok2] = true
-          local n = #owner_sources(ok2)
-          local c = "Remove all of " .. owner_key(src) .. " (" .. n .. ")"
-          choices[#choices + 1] = c; removable[c] = ok2
-        end
-      end
-    end
+    local choices = { "Add repository...", "Check sources" }
     local hx = tonumber(WindowHotspotInfo and WindowHotspotInfo(WIN, "b_repos", 1)) or 10
     local hy = tonumber(WindowHotspotInfo and WindowHotspotInfo(WIN, "b_repos", 4)) or 30
     local pick = WindowMenu(WIN, hx, hy, table.concat(choices, "|"))
-    if pick == "Add a repository..." then
+    if pick == "Add repository..." then
       local url = utils and utils.inputbox and utils.inputbox("Address of a GitHub repository (https://github.com/OWNER/REPO), a manifest (.json) or a plugin file (.xml):", "Add a repository", "")
       if url and trim(url) ~= "" then
         local u = normalize_source(url)
@@ -1992,8 +2004,7 @@ function PM_click(flags, id)
           if act_add_source(u) then act_check(false) end
         elseif not kind_of(u) then act_add_source(u) end
       end
-    elseif pick == "Check all sources now" then act_check(false)
-    elseif removable[pick] then act_remove_owner(removable[pick]) end
+    elseif pick == "Check sources" then act_check(false) end
     safeDraw(); return
   end
   if id == "b_repo" then if selected then act_open(selected) end; return end
@@ -2337,6 +2348,7 @@ local function ow_draw()
   btn("ow_add", "Add selected" .. (nsel > 0 and (" (" .. nsel .. ")") or ""), "Add the selected repositories as sources", nsel > 0 and P.idle or P.muted)
   btn("ow_none", "None", "Select none")
   btn("ow_all", "All", "Select all")
+  btn("ow_nofork", "Non-forked only", "Select only the repositories that are not forks")
   tx(OFONT_B, fitw(OFONT_B, ow.owner .. "   " .. #ow.repos .. " repositories", rx - L - PAD * 2), L + PAD, T + 7, P.text)
   local barH = lh + 12
   WindowLine(OWIN, L, T + barH, R, T + barH, P.edge, 0, 1)
@@ -2398,6 +2410,7 @@ end
 function OW_click(flags, id)
   if bit.band(flags, miniwin.hotspot_got_lh_mouse) == 0 then return end
   if id == "ow_all" then for _, r in ipairs(ow.repos) do r.checked = true end; ow_safedraw(); return end
+  if id == "ow_nofork" then for _, r in ipairs(ow.repos) do r.checked = not r.fork end; ow_safedraw(); return end
   if id == "ow_none" then for _, r in ipairs(ow.repos) do r.checked = false end; ow_safedraw(); return end
   local n = id:match("^ow_row(%d+)$")
   if n then local r = ow.repos[tonumber(n)]; if r then r.checked = not r.checked end; ow_safedraw(); return end
@@ -2436,7 +2449,7 @@ open_owner_window = function(owner, repos, partial)
   if not ok_theme then return false end
   if not (OW and WindowInfo(OWIN, 1)) then
     ow_added = {}
-    OW = ThemedBasicWindow(OWIN, 280, 150, 620, 420, "Repositories", "center", true, 1,
+    OW = ThemedBasicWindow(OWIN, 240, 150, 760, 420, "Repositories", "center", true, 1,
       function() ow_safedraw() end, function() ow_safedraw(); DoAfterSpecial(0.1, "pm_ow_redraw()", 12) end,
       function() OW = nil; ow_added = {}; if ow_sb then pcall(ow_sb.unInit, ow_sb) end; ow_sb = nil end,
       fontName, fontHeight, true)
@@ -2594,7 +2607,7 @@ function pm_command(name, line, wildcards)
     if not it.m then say(it.name .. " is not in the manifest. (pm check reads it; outside packages are links only: pm open)"); return end
     if cmd == "update" and not it.loaded then say(it.name .. " is not loaded: use  pm install  instead."); return end
     if cmd == "install" and it.loaded then say(it.name .. " is already loaded: use  pm update  to get a newer version."); return end
-    if cmd == "update" and not it.update then say(it.name .. " is already up to date (v" .. tostring(it.ver) .. ")."); return end
+    if cmd == "update" and not it.update and not it.changed then say(it.name .. " is already up to date (v" .. tostring(it.ver) .. ")."); return end
     run_jobs({ it }, cmd)
   elseif cmd == "remove" then act_remove(it)
   elseif cmd == "rollback" then
