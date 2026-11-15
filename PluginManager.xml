@@ -10,7 +10,7 @@
    save_state="y"
    date_written="2026-11-14 12:00:00"
    requires="5.07"
-   version="3.0"
+   version="3.2"
    sequence="-50"
    >
 <description trim="y">
@@ -163,11 +163,11 @@ local busy = nil                           -- a short description of the network
 
 local function vernum(v) return tonumber(v) end
 
--- a file name that may be written into the plugin folder: letters, digits, _ - . and spaces; no paths, no drive letters, no ":stream"
+-- a file name that may be written into the plugin folder: letters, digits, _ - . ( ) and spaces; no paths, no drive letters, no ":stream"
 H.RESERVED = {}                          -- Windows device names: "nul.lua" is the NUL device, whatever the extension
 for w in ("con prn aux nul com1 com2 com3 com4 com5 com6 com7 com8 com9 lpt1 lpt2 lpt3 lpt4 lpt5 lpt6 lpt7 lpt8 lpt9"):gmatch("%S+") do H.RESERVED[w] = true end
 local function safe_name(n)
-  return type(n) == "string" and n ~= "" and #n <= 100 and n:match("^[%w_][%w_%-%. ]*$") ~= nil and not n:match("[%. ]$") and not H.RESERVED[n:lower():match("^([^.]*)")]
+  return type(n) == "string" and n ~= "" and #n <= 100 and n:match("^[%w_(][%w_%-%. ()]*$") ~= nil and not n:match("[%. ]$") and not H.RESERVED[n:lower():match("^([^.]*)")]
 end
 
 -- Extra files a plugin needs (its .lua modules, data, sounds ...) may sit in sub-folders of the plugin's own folder: "lua/util.lua", "sounds/hit.wav".
@@ -188,6 +188,9 @@ end
 local DOC_STEMS, DOC_EXT = {}, { [""] = true, txt = true, md = true, markdown = true, rst = true, html = true }
 for w in ("readme license licence copying notice changelog changes contributing credit credits authors code_of_conduct security history"):gmatch("%S+") do DOC_STEMS[w] = true end
 function H.denied_file(base) return DENY_EXT[H.ext_of(base)] or false end
+local ARCHIVE_EXT = {}
+for e in ("zip rar 7z gz tgz bz2 xz tar iso"):gmatch("%S+") do ARCHIVE_EXT[e] = true end
+function H.is_archive(base) return ARCHIVE_EXT[H.ext_of(base)] or false end     -- an archive in a repository is a download, not a file a plugin needs: the manager cannot unpack it
 function H.is_standard_file(base)
   local b = base:lower()
   if b:sub(1, 1) == "." or b == "git.txt" then return true end
@@ -855,7 +858,7 @@ local MAX_SIZE = 1500000
 local function detect_repo(src, cb)
   local o, r, ref, sub = repo_parts(src.url)
   local function finish(entries, name, skipped, extra)
-    if #entries == 0 then cb(false, "no plugin files found" .. (extra and (" (" .. extra .. ")") or "")); return end
+    if #entries == 0 then cb(false, "no plugin files found" .. (extra and (" (" .. extra .. ")") or "") .. (src.skipnote and ("; left out: " .. src.skipnote) or "")); return end
     local best = {}
     for _, e in ipairs(entries) do if not best[e.id] or tonumber(e.version) > tonumber(best[e.id].version) then best[e.id] = e end end
     local list = {}
@@ -900,6 +903,7 @@ local function detect_repo(src, cb)
     end)
   end
   local function scan()
+    src.skipnote = nil
     http_get("https://api.github.com/repos/" .. o .. "/" .. r .. "/git/trees/" .. ref .. "?recursive=1", function(ok, body)
       if not ok then cb(false, "could not list the repository (" .. tostring(body) .. ")"); return end
       local dok, tree = pcall(json.decode, body)
@@ -939,7 +943,7 @@ local function detect_repo(src, cb)
           for _, bl in ipairs(blobs) do
             local rel
             if e.cdir == "" then rel = bl.path elseif bl.path:sub(1, #e.cdir + 1) == e.cdir .. "/" then rel = bl.path:sub(#e.cdir + 2) end
-            if rel and bl.path ~= e.cpath and owner_dir(bl.dir) == e.cdir and not H.is_standard_file(bl.file) and not H.denied_file(bl.file) then
+            if rel and bl.path ~= e.cpath and owner_dir(bl.dir) == e.cdir and not H.is_standard_file(bl.file) and not H.denied_file(bl.file) and not H.is_archive(bl.file) then
               -- a file that belongs to the plugin but cannot be installed makes the plugin incomplete: it is left out of the list rather than offered broken
               if bl.size > MAX_SIZE then e.incomplete = e.incomplete or (rel .. " is too large")
               elseif not H.rel_ok(rel) then e.incomplete = e.incomplete or (rel .. " has a name or a place the manager does not use")
@@ -1367,7 +1371,7 @@ local function act_add(path)
   local inside = root ~= "" and path:lower():gsub("/", "\\"):sub(1, #root) == root
   local target, made, aside = path, {}, {}
   if not inside then
-    if not safe_name(basename(path)) then say("The file name " .. basename(path) .. " is not usable (letters, digits, _ - . and spaces): rename it first."); return end
+    if not safe_name(basename(path)) then say("The file name " .. basename(path) .. " is not usable (letters, digits, _ - . ( ) and spaces): rename it first."); return end
     target = install_dir() .. basename(path)
     local function put(to, text)
       if exists(to) then
@@ -1539,14 +1543,42 @@ local function act_add_source(url)
   return true
 end
 
+function H.open_state()                              -- the owner and the repository that are open in the Store now (nil when closed), as the list would draw them
+  local so = var("store_owner", "")
+  local oo, first
+  if so ~= "#none" then
+    for _, s0 in ipairs(sources) do
+      if not s0.def then local k = owner_key(s0):lower(); if k == so then oo = k; break end; first = first or k end
+    end
+    oo = oo or first
+  end
+  local orp
+  if oo then
+    local mine = {}
+    for _, s0 in ipairs(sources) do if not s0.def and owner_key(s0):lower() == oo then mine[#mine + 1] = s0 end end
+    if #mine > 1 and var("store_open", "") ~= "none" then
+      for _, s0 in ipairs(mine) do if s0.url == var("store_open", "") then orp = s0.url end end
+      orp = orp or mine[1].url
+    end
+  end
+  return oo, orp
+end
 local function remove_sources(list, label)                -- stop listing these sources (never touches installed plugins)
   if busy then say("Wait for the " .. busy .. " to finish."); return false end
+  local open_owner, open_repo = H.open_state()
   local gone = {}
   for _, s0 in ipairs(list) do gone[s0.url] = true; drop_cache(s0) end
   local keep = {}
   for _, s0 in ipairs(sources) do if not s0.def and not gone[s0.url] then keep[#keep + 1] = s0.url end end
   SetVariable("sources", table.concat(keep, "\n"))
   build_sources()
+  -- what was open stays open and what was closed stays closed: removing a repository never opens another one in its place
+  if open_owner then
+    local left = false
+    for _, s0 in ipairs(sources) do if not s0.def and owner_key(s0):lower() == open_owner then left = true end end
+    SetVariable("store_owner", left and open_owner or "#none")
+    if open_repo then SetVariable("store_open", (gone[open_repo] or not left) and "none" or open_repo) end
+  end
   after_change()
   say("Stopped listing " .. label .. ". Plugins already installed from " .. (#list == 1 and "it" or "them") .. " stay installed.")
   return true
@@ -1695,7 +1727,7 @@ function H.check_here()                                    -- the Check button a
   if busy then say("Wait for the " .. busy .. " to finish."); return end
   local list = H.sel_sources()
   if #list == 0 then list = H.tab_sources(view.tab) end
-  if #list == 0 then say(view.tab == "other" and "Nothing on the Other tab comes from a source, so there is nothing to check." or "There is nothing to check on this tab. (Press Repos > Add repository on the Store tab.)"); return end
+  if #list == 0 then say(view.tab == "other" and "Nothing on the Other tab comes from a source, so there is nothing to check." or "There is nothing to check on this tab. (Press Add Repo on the Store tab.)"); return end
   view.sel = {}
   act_check(false, nil, list)
 end
@@ -1805,8 +1837,8 @@ local function draw()
     bigButton(busy and "Working..." or (nsel > 0 and ((W < 560 and "Check (" or "Check selected (") .. nsel .. ")") or "Check all"), "b_check", tip, busy and P.warn or nil)
   end
   if updates_count() > 0 then bigButton("Update all", "b_updall", "Install every update that is waiting", P.warn) end
-  bigButton("Add", "b_add", "Add a plugin file you downloaded yourself")
-  if view.tab == "store" then bigButton("Repos", "b_repos", "Add a repository, or check the sources again (remove one with the button on its header)") end
+  if view.tab == "store" then bigButton("Add Repo", "b_addrepo", "Add a repository (a GitHub address); remove one with the button on its header")
+  else bigButton("Add", "b_add", "Add a plugin file you downloaded yourself") end
   local cx = L + PAD
   for _, name in ipairs(TAB_ORDER) do
     local label = TAB_LABEL[name]
@@ -1846,7 +1878,7 @@ local function draw()
     if view.tab == "store" then
       local extra = 0
       for _, sx in ipairs(sources) do if not sx.def then extra = extra + 1 end end
-      if extra == 0 then none = "No repositories yet. Press Repos > Add repository (a GitHub address), or type  pm source add https://github.com/OWNER/REPO"
+      if extra == 0 then none = "No repositories yet. Press Add Repo (a GitHub address), or type  pm source add https://github.com/OWNER/REPO"
       else none = "Nothing found in the repositories yet. Press Check." end
     end
     text(FONT, fit(FONT, none, W - 2 * PAD - sbw), L + PAD, listTop + PAD, P.muted)
@@ -2070,13 +2102,9 @@ function PM_click(flags, id)
     if path and path ~= "" then act_add(path) else say("pm add FILE   adds a plugin file you downloaded.") end
     return
   end
-  if id == "b_repos" then
+  if id == "b_addrepo" then
     if busy then say("Wait for the " .. busy .. " to finish."); return end
-    local choices = { "Add repository...", "Check sources" }
-    local hx = tonumber(WindowHotspotInfo and WindowHotspotInfo(WIN, "b_repos", 1)) or 10
-    local hy = tonumber(WindowHotspotInfo and WindowHotspotInfo(WIN, "b_repos", 4)) or 30
-    local pick = WindowMenu(WIN, hx, hy, table.concat(choices, "|"))
-    if pick == "Add repository..." then
+    do
       local url = utils and utils.inputbox and utils.inputbox("Address of a GitHub repository (https://github.com/OWNER/REPO), a manifest (.json) or a plugin file (.xml):", "Add a repository", "")
       if url and trim(url) ~= "" then
         local u = normalize_source(url)
@@ -2085,7 +2113,7 @@ function PM_click(flags, id)
           if ns then act_check(false, nil, type(ns) == "table" and { ns } or nil) end
         elseif not kind_of(u) then act_add_source(u) end
       end
-    elseif pick == "Check sources" then H.check_here() end
+    end
     safeDraw(); return
   end
   if id == "b_repo" then if selected then act_open(selected) end; return end
@@ -2106,6 +2134,15 @@ function PM_click(flags, id)
     local row = shown[tonumber(fg)]
     if not (row and row.header) then say("That row has changed; try again."); return end
     if busy then say("Wait for the " .. busy .. " to finish."); return end
+    if row.header == "owner" and row.repos > 1 and open_owner_window then       -- several repositories: a checklist, all ticked, untick the ones to keep
+      local rr = {}
+      for _, s0 in ipairs(owner_sources(row.key)) do
+        local np = s0.data and type(s0.data.plugins) == "table" and #s0.data.plugins or 0
+        rr[#rr + 1] = { name = repo_part(s0, row.name), url = s0.url, src = s0, checked = true, pushed = "",
+                        desc = s0.err and ("could not be read: " .. tostring(s0.err)) or (np .. " plugin" .. (np == 1 and "" or "s")) }
+      end
+      if open_owner_window(row.name, rr, nil, "remove") then return end
+    end
     if row.header == "owner" then
       local list = owner_sources(row.key)
       if confirm("Stop listing " .. #list .. " repositor" .. (#list == 1 and "y" or "ies") .. " of " .. row.name .. "?\n\nPlugins you already installed from " .. (#list == 1 and "it" or "them") .. " stay installed; only the Store listing goes away.") then act_remove_owner(row.key) end
@@ -2380,7 +2417,7 @@ end
 ---------------------------------------------------------------------------
 local OWIN = "PluginManagerOwnerWin"
 local OW, ow_sb = nil, nil
-local ow = { owner = "", repos = {}, top = 0, status = "" }
+local ow = { owner = "", repos = {}, top = 0, status = "", mode = "add" }
 local ow_added = {}
 local OFONT, OFONT_B, OFONT_S = "po_f", "po_fb", "po_fs"
 local ow_step
@@ -2425,11 +2462,17 @@ local function ow_draw()
     hs(id, rx - bw, T + 5, rx, T + 3 + lh + 4, tip)
     rx = rx - bw - 5
   end
+  if ow.mode == "remove" then
+    btn("ow_rem", "Remove selected" .. (nsel > 0 and (" (" .. nsel .. ")") or ""), "Stop listing the ticked repositories (plugins already installed stay)", nsel > 0 and P.warn or P.muted)
+    btn("ow_none", "None", "Select none")
+    btn("ow_all", "All", "Select all")
+  else
   btn("ow_scan", "Look for plugins in all", "Look through every repository (not forks, archived or empty ones) for MUSHclient plugins and add the ones that have some", P.warn)
   btn("ow_add", "Add selected" .. (nsel > 0 and (" (" .. nsel .. ")") or ""), "Add the selected repositories as sources", nsel > 0 and P.idle or P.muted)
   btn("ow_none", "None", "Select none")
   btn("ow_all", "All", "Select all")
   btn("ow_nofork", "Non-forked only", "Select only the repositories that are not forks")
+  end
   tx(OFONT_B, fitw(OFONT_B, ow.owner .. "   " .. #ow.repos .. " repositories", rx - L - PAD * 2), L + PAD, T + 7, P.text)
   local barH = lh + 12
   WindowLine(OWIN, L, T + barH, R, T + barH, P.edge, 0, 1)
@@ -2472,9 +2515,9 @@ local function ow_draw()
     ow_sb:setScroll(ow.top + 1, visible, math.max(#ow.repos, visible), true)
     ow_sb:draw(true)
   end
-  local msg = ow.status ~= "" and ow.status or "Select repositories and press Add selected, or let the manager look through all of them for plugins."
+  local msg = ow.status ~= "" and ow.status or (ow.mode == "remove" and "Untick the ones to keep, then press Remove selected. Installed plugins stay installed." or "Select repositories and press Add selected, or let the manager look through all of them for plugins.")
   tx(OFONT_S, fitw(OFONT_S, msg, W - 2 * PAD), L + PAD, listBottom + 5, ow.status ~= "" and P.warn or P.muted)
-  win:dress_window("Repositories of " .. ow.owner)
+  win:dress_window((ow.mode == "remove" and "Remove repositories of " or "Repositories of ") .. ow.owner)
 end
 local function ow_safedraw()
   local ok, err = pcall(ow_draw)
@@ -2496,6 +2539,24 @@ function OW_click(flags, id)
   local n = id:match("^ow_row(%d+)$")
   if n then local r = ow.repos[tonumber(n)]; if r then r.checked = not r.checked end; ow_safedraw(); return end
   if busy then say("Wait for the " .. busy .. " to finish."); return end
+  if id == "ow_rem" then
+    local sel = ow_checked()
+    if #sel == 0 then ow.status = "Nothing is selected."; ow_safedraw(); return end
+    if not confirm("Stop listing " .. #sel .. " repositor" .. (#sel == 1 and "y" or "ies") .. " of " .. ow.owner .. "?\n\nPlugins you already installed from " .. (#sel == 1 and "it" or "them") .. " stay installed; only the Store listing goes away.") then return end
+    local list, keep, live_urls = {}, {}, {}
+    for _, s0 in ipairs(sources) do live_urls[s0.url] = true end
+    for _, r in ipairs(ow.repos) do                                         -- a row whose source was removed meanwhile (elsewhere) is just dropped
+      if not live_urls[r.url] then
+      elseif r.checked then list[#list + 1] = r.src else keep[#keep + 1] = r end
+    end
+    if #list == 0 then ow.repos, ow.top, ow.status = keep, 0, "Those were already removed."; if #keep == 0 and OW then OW:hide() else ow_safedraw() end; return end
+    remove_sources(list, #list == 1 and src_label(list[1]) or (ow.owner .. " (" .. #list .. " repositories)"))
+    selected, sel_key = nil, nil
+    ow.repos, ow.top = keep, 0
+    if #keep == 0 then if OW then OW:hide() end; return end
+    ow.status = #list .. " removed."
+    ow_safedraw(); return
+  end
   if id == "ow_add" then
     local sel = ow_checked()
     if #sel == 0 then ow.status = "Nothing is selected."; ow_safedraw(); return end
@@ -2527,7 +2588,7 @@ function OW_click(flags, id)
   end
 end
 
-open_owner_window = function(owner, repos, partial)
+open_owner_window = function(owner, repos, partial, mode)
   if not ok_theme then return false end
   if not (OW and WindowInfo(OWIN, 1)) then
     ow_added = {}
@@ -2537,7 +2598,7 @@ open_owner_window = function(owner, repos, partial)
       fontName, fontHeight, true)
     table.insert(OW.menu_table, "Close"); table.insert(OW.menu_handlers, function() OW:hide() end)
   end
-  ow.owner, ow.repos, ow.top, ow.status = owner, repos, 0, partial and ("Note: " .. partial) or ""
+  ow.owner, ow.repos, ow.top, ow.status, ow.mode = owner, repos, 0, partial and ("Note: " .. partial) or "", mode or "add"
   OW:show(); ow_safedraw()
   for _, t in ipairs({ 0.1, 0.3, 1 }) do DoAfterSpecial(t, "pm_ow_redraw()", 12) end
   return true
@@ -2736,7 +2797,7 @@ function OnPluginListChanged() refresh(); redraw_window() end
 function OnPluginClose() closing = true; if TW then pcall(function() TW:hide() end) end; if LW then pcall(function() LW:hide() end) end; if OW then pcall(function() OW:hide() end) end end
 
 -- for the tests
-PmTest = { items = function() return items end, shown = function() return shown end, listed = function() return listed end, manifest = main_data, sources = function() return sources end, view = view, draw = draw, find = find, sel_sources = H.sel_sources,
+PmTest = { items = function() return items end, shown = function() return shown end, listed = function() return listed end, manifest = main_data, sources = function() return sources end, view = view, draw = draw, find = find, sel_sources = H.sel_sources, safe_name = safe_name,
            parse = parse_manifest, refresh = refresh, owner = owner_of, forget_cache = function() cache = nil end, standard = H.is_standard_file, relok = H.rel_ok, kind = function(u) return kind_of(normalize_source(u)) end }
 ]]>
 </script>
