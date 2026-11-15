@@ -10,14 +10,18 @@
    save_state="y"
    date_written="2026-11-14 12:00:00"
    requires="5.07"
-   version="2.9"
+   version="3.0"
    sequence="-50"
    >
 <description trim="y">
 Plugin Manager
   pm                          open or close the manager window
   pm list [crowley|stock|other|store|links|updates|all]    list plugins as text (numbers work in every command)
-  pm check                    read the manifest and the repositories, mark plugins that have a newer version
+  pm check [crowley|other|store|all|NAME|NUMBER]
+                              read the sources and mark plugins that have a newer version or a changed file. No word: every source.
+                              A tab name checks only what that tab comes from; a plugin checks just its own source. Stock plugins are never
+                              checked (the AardMUSHclient package updates them). In the window: tick plugins or repositories and press
+                              Check selected, or press Check all for the tab you are on. Adding a repository reads only that repository
   pm force NAME|NUMBER        replace an installed plugin with a look-alike offered by a repository (a fork): backs up the current one, takes it out, installs the repository's
   pm update NAME|NUMBER|all   download the newer version, keep the old file as a backup, reload it
   pm install NAME|NUMBER      download a plugin that is offered but not loaded, and load it
@@ -39,7 +43,7 @@ Plugin Manager
   pm save                     save the world file, so what is loaded now is loaded next time
   pm manifest [URL|reset]     show or set the address of the main manifest (https only)
   pm dir [FOLDER]             show or set the folder new plugins are installed into
-  pm auto on|off              check about once a day and say when there are updates (never installs anything)
+  pm auto on|off              read the main manifest about once a day and say when there are updates (never installs anything; repositories are checked by hand)
   pm help                     this list
 NAME can be part of a name. Nothing is ever installed or updated without a command or a button click.
 </description>
@@ -445,13 +449,13 @@ local function refresh()
     end
   end
   for _, it in ipairs(items) do
-    if it.m then
+    it.group = it.outside and "other" or group_of(it)          -- link-only entries (the manifest's "outside" list) sit under Other with the rest
+    if it.m and it.group ~= "stock" and not (it.loaded and STOCK[basename((it.file or ""):lower())]) then                       -- stock plugins are never checked: they are updated with the AardMUSHclient package
       local mv, iv = vernum(it.m.version), vernum(it.ver)
       it.update = (it.loaded and mv and iv and mv > iv) and true or false
       it.ahead = (it.loaded and mv and iv and iv > mv) and true or false
       it.changed = (it.loaded and not it.update and not it.ahead and H.differs(it)) and true or false     -- same version, but not the file the source offers
     end
-    it.group = it.outside and "other" or group_of(it)          -- link-only entries (the manifest's "outside" list) sit under Other with the rest
   end
   table.sort(items, function(a, b)
     if a.group ~= b.group then return ORDER[a.group] < ORDER[b.group] end
@@ -991,20 +995,23 @@ local function detect_repo(src, cb)
   manifest_try(scan)
 end
 
-local function fetch_sources(cb)                            -- reads every source, one after the other; cb(any_ok, first_problem)
+local function fetch_sources(cb, only)                       -- reads the sources one after the other (every one, or just the list "only"); cb(any_ok, first_problem)
   if #sources == 0 then cb(false, "no manifest address is set: pm manifest https://...   (or add a repository: pm source add URL)"); return end
+  local list = only or sources
+  if #list == 0 then cb(false, "there is nothing to check here"); return end
   local i, anyok, first = 0, false, nil
+  local defok = false                                            -- the time of the last check only moves when the main manifest itself was read
   local function nextsrc()
     i = i + 1
-    local src = sources[i]
+    local src = list[i]
     if not src then
-      if anyok then checked_at = os.time(); SetVariable("manifest_at", tostring(checked_at)) end
+      if defok then checked_at = os.time(); SetVariable("manifest_at", tostring(checked_at)) end
       refresh()
       cb(anyok, first); return
     end
     local function done(ok, why)
       src.err = (not ok) and tostring(why) or nil
-      if ok then anyok = true elseif not first then first = (#sources > 1 and (src_label(src) .. ": ") or "") .. tostring(why) end
+      if ok then anyok = true; if src.def then defok = true end elseif not first then first = (#list > 1 and (src_label(src) .. ": ") or "") .. tostring(why) end
       nextsrc()
     end
     local f = src.kind == "manifest" and fetch_manifest_source or detect_repo
@@ -1217,7 +1224,7 @@ local function run_jobs(list, verb)                      -- one at a time; the m
   nextjob()
 end
 
-local function act_check(quiet, finished)               -- finished(ok, problem) is called when the check is over
+local function act_check(quiet, finished, only)         -- finished(ok, problem) is called when the check is over. only: a list of sources (no list: all of them)
   if busy then if not quiet then say("Wait for the " .. busy .. " to finish.") end; return end
   busy = "check"
   fetch_sources(function(ok, why)
@@ -1233,15 +1240,17 @@ local function act_check(quiet, finished)               -- finished(ok, problem)
     local n = updates_count() - c
     if n > 0 then say(n .. " update" .. (n == 1 and "" or "s") .. " available:  pm list updates   (pm update all installs them)") end
     if c > 0 then say(c .. " plugin" .. (c == 1 and " has" or "s have") .. " changes detected: the file offered is not the one you have, though the version is the same (pm update NAME or pm update all gets them)") end
-    if n == 0 and c == 0 and not quiet then say("Everything listed is up to date.") end
+    if n == 0 and c == 0 and not quiet then say(only and "Everything that was checked is up to date." or "Everything listed is up to date.") end
     after_change()
-  end)
+  end, only)
 end
 
 function pm_autocheck()
   if var("auto", "on") ~= "on" or #sources == 0 then return end
   if os.time() - checked_at < 20 * 3600 then return end
-  act_check(true)
+  local main = {}                                          -- the daily check reads only the main manifest; the repositories are checked by hand (they are slower and GitHub limits the requests)
+  for _, s0 in ipairs(sources) do if s0.def then main[#main + 1] = s0 end end
+  if #main > 0 then act_check(true, nil, main) end
 end
 
 -- a yes/no question in a dialog (the window's buttons ask; typed commands do not, you just typed them). Without dialogs the answer is yes.
@@ -1433,13 +1442,15 @@ local function fetch_owner_repos(owner, cb)                -- cb(ok, repos | rea
 end
 
 local function add_repo_sources(urls)                      -- put these repositories on the source list (already listed ones are skipped); returns how many were new
-  local have, t, n = {}, {}, 0
+  local have, t, n, newset = {}, {}, 0, {}
   for _, s0 in ipairs(sources) do have[canon_url(s0.url)] = true; if not s0.def then t[#t + 1] = s0.url end end
-  for _, u in ipairs(urls) do if not have[canon_url(u)] then have[canon_url(u)] = true; t[#t + 1] = u; n = n + 1 end end
+  for _, u in ipairs(urls) do if not have[canon_url(u)] then have[canon_url(u)] = true; newset[canon_url(u)] = true; t[#t + 1] = u; n = n + 1 end end
   SetVariable("sources", table.concat(t, "\n"))
   build_sources()
   refresh()                                                 -- the rows must point at the new source tables, or the Store tab shows nothing until the next check ends
-  return n
+  local fresh = {}
+  for _, s0 in ipairs(sources) do if newset[canon_url(s0.url)] then fresh[#fresh + 1] = s0 end end     -- only the new ones are read
+  return n, fresh
 end
 
 local SCAN_MAX = 50                                        -- repositories looked through in one go (the tree request counts against GitHub's 60 an hour)
@@ -1524,6 +1535,7 @@ local function act_add_source(url)
   build_sources()
   after_change()
   say("Added " .. label .. ". Plugins from outside sources run inside MUSHclient, so install only from people you trust. Nothing is installed without a command or a click.")
+  for _, s0 in ipairs(sources) do if canon_url(s0.url) == canon_url(url) then return s0 end end
   return true
 end
 
@@ -1649,7 +1661,44 @@ local PAD, ROW_PAD = 8, 4
 local TW
 local closing = false                      -- the plugin is closing: the window being deleted then is not the user closing it
 local added = {}
-local view = { tab = "mine", top = 0, lh = 14 }
+local view = { tab = "mine", top = 0, lh = 14, sel = {} }
+
+-- what a check reads. Nothing ticked: everything the tab shows comes from (Crowley: the main manifest; Other: the sources of its plugins; Store: every
+-- repository; All: everything; Stock: nothing, those plugins are updated with the AardMUSHclient package). Something ticked: just the sources of those.
+function H.tab_sources(tab)
+  local want = {}
+  if tab == "all" then for _, s0 in ipairs(sources) do want[s0] = true end
+  elseif tab == "mine" then for _, s0 in ipairs(sources) do if s0.def then want[s0] = true end end
+  elseif tab == "store" then for _, s0 in ipairs(sources) do if not s0.def then want[s0] = true end end
+  elseif tab == "other" then for _, it in ipairs(items) do if it.group == "other" and it.src then want[it.src] = true end end end
+  local out = {}
+  for _, s0 in ipairs(sources) do if want[s0] then out[#out + 1] = s0 end end
+  return out
+end
+function H.is_stock(it) return it.group == "stock" or (it.loaded and it.file and STOCK[basename(it.file:lower())]) and true or false end
+function H.sel_sources()                                   -- the sources of the ticked rows, and how many ticks still point at something
+  local want, n = {}, 0
+  for k in pairs(view.sel) do
+    local kind, v = k:sub(1, 1), k:sub(3)
+    local found = {}
+    if kind == "p" then local it = live(v); if it and it.src and not H.is_stock(it) then found[1] = it.src end
+    elseif kind == "r" then for _, s0 in ipairs(sources) do if not s0.def and s0.url == v then found[1] = s0 end end
+    elseif kind == "o" then found = owner_sources(v) end
+    if #found > 0 then n = n + 1; for _, s0 in ipairs(found) do want[s0] = true end end
+  end
+  local out = {}
+  for _, s0 in ipairs(sources) do if want[s0] then out[#out + 1] = s0 end end
+  return out, n
+end
+function H.check_here()                                    -- the Check button and menu entry
+  if view.tab == "stock" then say("Stock plugins are never checked: they are updated with the AardMUSHclient package."); return end
+  if busy then say("Wait for the " .. busy .. " to finish."); return end
+  local list = H.sel_sources()
+  if #list == 0 then list = H.tab_sources(view.tab) end
+  if #list == 0 then say(view.tab == "other" and "Nothing on the Other tab comes from a source, so there is nothing to check." or "There is nothing to check on this tab. (Press Repos > Add repository on the Store tab.)"); return end
+  view.sel = {}
+  act_check(false, nil, list)
+end
 local menuIdx = {}
 local fontName = GetAlphaOption("output_font_name")          -- the world's output font: used for the title bar, and for the list unless one was chosen
 local fontHeight = GetOption("output_font_height")
@@ -1696,7 +1745,7 @@ local function hotspot(id, x1, y1, x2, y2, tip)
   if WindowMoveHotspot(WIN, id, x1, y1, x2, y2) ~= 0 then
     WindowAddHotspot(WIN, id, x1, y1, x2, y2, "", "", "", "", "PM_click", tip or "", 1, 0)
     -- the wheel goes to the hotspot under the mouse only, and the rows and their buttons sit on top of the list's own hotspot: they need the handler too
-    if id:match("^z") or id:match("^b_%a+_%d+$") then WindowScrollwheelHandler(WIN, id, "PM_wheel") end
+    if id:match("^z") or id:match("^c_row") or id:match("^b_%a+_%d+$") then WindowScrollwheelHandler(WIN, id, "PM_wheel") end
   end
   added[id] = true
 end
@@ -1720,6 +1769,13 @@ local function rowButtons(it)                              -- the buttons a row 
   return b
 end
 
+function H.sel_key(it)                                      -- the check box of a row: a header (owner or repository) or a plugin that comes from a source (stock ones never)
+  if it.header == "owner" then return "o:" .. it.key end
+  if it.header then return "r:" .. it.src.url end
+  if it.src and not H.is_stock(it) and not it.outside then return "p:" .. key_of(it) end
+  return nil
+end
+
 local function draw()
   local win = TW
   if not win or not win.bodyleft then return end
@@ -1741,7 +1797,13 @@ local function draw()
     hotspot(id, rx - bw, T + 5, rx, T + 3 + lh + 4, tip)
     rx = rx - bw - 5
   end
-  bigButton(busy and "Working..." or "Check", "b_check", "Read the manifest and the repositories, and mark plugins that have a newer version", busy and P.warn or nil)
+  if view.tab ~= "stock" then                                   -- (stock plugins are never checked)
+    local _, nsel = H.sel_sources()
+    local tip = nsel > 0 and "Check only the plugins and repositories that are ticked" or
+      (view.tab == "mine" and "Read the main manifest and mark plugins that have changed" or view.tab == "other" and "Check the sources of the plugins on this tab" or
+       view.tab == "store" and "Check every repository (tick some to check only those)" or "Check the main manifest and every repository (tick some to check only those)")
+    bigButton(busy and "Working..." or (nsel > 0 and ((W < 560 and "Check (" or "Check selected (") .. nsel .. ")") or "Check all"), "b_check", tip, busy and P.warn or nil)
+  end
   if updates_count() > 0 then bigButton("Update all", "b_updall", "Install every update that is waiting", P.warn) end
   bigButton("Add", "b_add", "Add a plugin file you downloaded yourself")
   if view.tab == "store" then bigButton("Repos", "b_repos", "Add a repository, or check the sources again (remove one with the button on its header)") end
@@ -1771,7 +1833,8 @@ local function draw()
   if view.top < 0 then view.top = 0 end
   local sbw = ok_sb and ((Theme.RESIZER_SIZE or 14)) or 0         -- width of the scroll bar on the right
   local RR = R - sbw - (sbw > 0 and 1 or 0)                          -- rows end here
-  local cName = L + PAD + lh + 4                               -- columns: plugin, version, author (the state word follows the author when there is room)
+  local cbw = lh + 2                                           -- the check box column at the left
+  local cName = L + PAD + cbw + lh + 4                               -- columns: plugin, version, author (the state word follows the author when there is room)
   local colV = cName + math.max(130, math.floor(W * 0.27))
   local colA = colV + math.max(85, math.floor(W * 0.14))
   text(FONT_S, "Plugin", cName, T + barH + 3, P.muted); text(FONT_S, "Version", colV, T + barH + 3, P.muted); text(FONT_S, "Author", colA, T + barH + 3, P.muted)
@@ -1797,7 +1860,7 @@ local function draw()
     local ind = shown_indent[it] or 0
     if it.header then                                                    -- an owner or a repository: click to open it (the others close)
       fillRect(L, y1, RR, y2, it.header == "owner" and P.hot or P.panel)
-      text(FONT_B, it.open and "v" or ">", L + PAD + ind, y1 + ROW_PAD, P.idle)
+      text(FONT_B, it.open and "v" or ">", L + PAD + cbw + ind, y1 + ROW_PAD, P.idle)
       local rmlabel = (it.header == "owner" and it.repos > 1) and "Remove repos" or "Remove repo"
       local rmw = textW(FONT_S, "Remove repos") + 14                           -- the button at the right end of the header
       local label = fit(FONT_B, it.name, RR - L - 260 - ind - rmw)
@@ -1819,7 +1882,7 @@ local function draw()
     else
     if selected == it then fillRect(L, y1, RR, y2, P.sel) elseif i % 2 == 0 then fillRect(L, y1, RR, y2, P.panel) end
     local dot = (it.update or it.changed) and P.warn or (it.loaded and (it.enabled and P.on or P.off) or P.idle)
-    disc(L + PAD + ind, y1 + ROW_PAD + 3, L + PAD + ind + lh - 4, y1 + ROW_PAD + lh - 1, dot)
+    disc(L + PAD + cbw + ind, y1 + ROW_PAD + 3, L + PAD + cbw + ind + lh - 4, y1 + ROW_PAD + lh - 1, dot)
     local ver = it.ver and ("v" .. it.ver) or (it.m and ("v" .. tostring(it.m.version)) or "")
     if it.update then ver = "v" .. tostring(it.ver) .. " > v" .. tostring(it.m.version) end
     local state = (not it.loaded and not it.outside) and "not loaded" or (it.outside and "link only" or (it.changed and "changes detected") or (not it.enabled and "disabled" or ""))
@@ -1849,6 +1912,14 @@ local function draw()
     end
     if (state == "" or aw <= 140) and aw > 40 and au ~= "" then text(FONT_S, fit(FONT_S, au, aw), colA, y1 + ROW_PAD + 1, P.text) end
     hotspot("z_row" .. n, L, y1, bx, y2, it.name)
+    end
+    local skey = H.sel_key(it)
+    if skey and not busy then
+      local bx1, by1 = L + PAD, y1 + ROW_PAD + 1
+      fillRect(bx1, by1, bx1 + lh - 3, by1 + lh - 3, view.sel[skey] and P.idle or P.bg)
+      WindowRectOp(WIN, 1, bx1, by1, bx1 + lh - 3, by1 + lh - 3, P.edge)
+      if view.sel[skey] then text(FONT_S, "x", bx1 + 3, by1 - 1, P.text) end
+      hotspot("c_row" .. n, L, y1, L + PAD + cbw - 2, y2, view.sel[skey] and "Not selected for checking" or "Select for checking (Check selected reads only the ticked ones)")
     end
   end
   if ok_sb then
@@ -1901,10 +1972,11 @@ local function draw()
     text(FONT_S, fit(FONT_S, detail, rx2 - L - PAD - 6), L + PAD, y3, P.muted)
   else
     local msg
-    if #sources == 0 then msg = "No manifest address yet: type  pm manifest https://...  or add a repository on the Store tab."
+    if view.tab == "stock" then msg = "Stock plugins come with the AardMUSHclient package and are never checked: update the package to update them."
+    elseif #sources == 0 then msg = "No manifest address yet: type  pm manifest https://...  or add a repository on the Store tab."
     elseif last_err then msg = "Last check: " .. last_err
     elseif checked_at > 0 then msg = "Checked " .. os.date("%H:%M", checked_at) .. ". Click a plugin for details."
-    else msg = "Press Check to read the manifest. Click a plugin for details." end
+    else msg = "Press Check all to read the manifest. Click a plugin for details." end
     text(FONT_S, fit(FONT_S, msg, W - 2 * PAD), L + PAD, fy, P.muted)
   end
   win:dress_window("Plugins")
@@ -1935,7 +2007,7 @@ local function ensureWindow()
   TW = ThemedBasicWindow(WIN, 200, 140, 680, 400, "Plugins", "center", true, 1,
     function() safeDraw() end, function() safeDraw(); DoAfterSpecial(0.1, "pm_redraw()", 12) end, function() TW = nil; added = {}; if sb then pcall(sb.unInit, sb) end; sb = nil; if not closing then SetVariable("visible", "0") end end,
     fontName, fontHeight, true)
-  table.insert(TW.menu_table, "Check for updates"); table.insert(TW.menu_handlers, function() act_check(false) end)
+  table.insert(TW.menu_table, "Check for updates"); table.insert(TW.menu_handlers, function() H.check_here() end)
   table.insert(TW.menu_table, "Update everything that has an update"); table.insert(TW.menu_handlers, function() window_update_all() end)
   table.insert(TW.menu_table, "Add a plugin file..."); table.insert(TW.menu_handlers, function() Execute("pm add") end)
   table.insert(TW.menu_table, "Font..."); table.insert(TW.menu_handlers, function() Execute("pm font pick") end)
@@ -1980,8 +2052,15 @@ end
 function PM_click(flags, id)
   if bit.band(flags, miniwin.hotspot_got_lh_mouse) == 0 then return end
   local tab = id:match("^a_tab_(.+)$")
-  if tab then view.tab = tab; view.top = 0; selected, sel_key = nil, nil; safeDraw(); return end
-  if id == "b_check" then act_check(false); safeDraw(); return end
+  if tab then view.tab = tab; view.top = 0; view.sel = {}; selected, sel_key = nil, nil; safeDraw(); return end
+  if id == "b_check" then H.check_here(); safeDraw(); return end
+  local cn = id:match("^c_row(%d+)$")
+  if cn then
+    local row = shown[tonumber(cn)]
+    local key = row and H.sel_key(row)
+    if key then view.sel[key] = (not view.sel[key]) or nil end
+    safeDraw(); return
+  end
   if id == "b_updall" then
     window_update_all(); return
   end
@@ -2002,10 +2081,11 @@ function PM_click(flags, id)
       if url and trim(url) ~= "" then
         local u = normalize_source(url)
         if kind_of(u) and confirm("Add " .. src_label({ url = u }) .. " as a source of plugins?\n\nPlugins from outside sources run inside MUSHclient. Nothing is installed without a click, but only add people you trust.") then
-          if act_add_source(u) then act_check(false) end
+          local ns = act_add_source(u)
+          if ns then act_check(false, nil, type(ns) == "table" and { ns } or nil) end
         elseif not kind_of(u) then act_add_source(u) end
       end
-    elseif pick == "Check sources" then act_check(false) end
+    elseif pick == "Check sources" then H.check_here() end
     safeDraw(); return
   end
   if id == "b_repo" then if selected then act_open(selected) end; return end
@@ -2423,14 +2503,15 @@ function OW_click(flags, id)
          (#sel > 25 and "\n\nReading that many repositories uses a lot of GitHub requests (60 an hour without an account); some may fail until later." or "")) then return end
     local urls = {}
     for _, r in ipairs(sel) do urls[#urls + 1] = r.url end
-    local n2 = add_repo_sources(urls)
+    local n2, fresh = add_repo_sources(urls)
     ow.status = n2 .. " added" .. ((#urls - n2) > 0 and (", " .. (#urls - n2) .. " were already listed") or "") .. ". Reading them..."
     for _, r in ipairs(ow.repos) do r.checked = false end
     ow_safedraw()
+    if #fresh == 0 then ow.status = n2 .. " added, " .. (#urls - n2) .. " already listed. Nothing new to read."; ow_safedraw(); return end
     act_check(false, function(ok2, problem)
       ow.status = ok2 and ("Done: see the Store tab." .. (problem and ("  Not everything could be read: " .. tostring(problem)) or "")) or ("Could not be read: " .. tostring(problem))
       if OW then ow_safedraw() end
-    end)
+    end, fresh)
     return
   end
   if id == "ow_scan" then
@@ -2481,13 +2562,30 @@ function pm_command(name, line, wildcards)
     if not FILTERS[which] then say("List which? crowley, stock, other, store, links, updates or all."); return end
     print_list(which); return
   end
-  if cmd == "check" then act_check(false); return end
+  if cmd == "check" then
+    if #items == 0 then refresh() end
+    local arg3 = rest:lower()
+    local TABS = { crowley = "mine", mine = "mine", other = "other", store = "store", all = "all", [""] = "all" }
+    if arg3 == "stock" then say("Stock plugins are never checked: they are updated with the AardMUSHclient package."); return end
+    if TABS[arg3] then
+      local list = H.tab_sources(TABS[arg3])
+      if #sources == 0 then act_check(false); return end                -- says how to add one
+      if #list == 0 then say("There is nothing to check there (no sources)."); return end
+      act_check(false, nil, list); return
+    end
+    local it, why = find(rest)                                          -- one plugin: its source is read
+    if not it then say(why); return end
+    if it.group == "stock" then say(it.name .. " is a stock plugin: it is updated with the AardMUSHclient package, so it is never checked."); return end
+    if not it.src then say(it.name .. " does not come from a source, so there is nothing to check."); return end
+    act_check(false, nil, { it.src }); return
+  end
   if cmd == "source" or cmd == "sources" or cmd == "repo" then
     local sub, arg2 = rest:match("^(%S+)%s*(.*)$")
     sub = (sub or ""):lower()
     if sub == "add" then
       if arg2 == "" then say("pm source add URL   (a GitHub repository, a manifest .json or a plugin .xml, https only)"); return end
-      if act_add_source(arg2) then act_check(false) end
+      local ns = act_add_source(arg2)
+      if ns then act_check(false, nil, type(ns) == "table" and { ns } or nil) end
     elseif sub == "scan" then
       local o = owner_of(normalize_source(arg2))
       if not o then say("pm source scan URL   (a GitHub user or organization, for example https://github.com/AardPlugins)"); return end
@@ -2638,7 +2736,7 @@ function OnPluginListChanged() refresh(); redraw_window() end
 function OnPluginClose() closing = true; if TW then pcall(function() TW:hide() end) end; if LW then pcall(function() LW:hide() end) end; if OW then pcall(function() OW:hide() end) end end
 
 -- for the tests
-PmTest = { items = function() return items end, shown = function() return shown end, listed = function() return listed end, manifest = main_data, sources = function() return sources end, view = view, draw = draw, find = find,
+PmTest = { items = function() return items end, shown = function() return shown end, listed = function() return listed end, manifest = main_data, sources = function() return sources end, view = view, draw = draw, find = find, sel_sources = H.sel_sources,
            parse = parse_manifest, refresh = refresh, owner = owner_of, forget_cache = function() cache = nil end, standard = H.is_standard_file, relok = H.rel_ok, kind = function(u) return kind_of(normalize_source(u)) end }
 ]]>
 </script>
