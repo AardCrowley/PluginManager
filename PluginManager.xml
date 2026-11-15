@@ -10,7 +10,7 @@
    save_state="y"
    date_written="2026-11-14 12:00:00"
    requires="5.07"
-   version="2.8"
+   version="2.9"
    sequence="-50"
    >
 <description trim="y">
@@ -471,9 +471,9 @@ local function changed_count()
   return n
 end
 
-local function updates_count()
+local function updates_count()                              -- newer versions and changed files: what Update all installs
   local n = 0
-  for _, it in ipairs(items) do if it.update then n = n + 1 end end
+  for _, it in ipairs(items) do if it.update or it.changed then n = n + 1 end end
   return n
 end
 
@@ -1229,9 +1229,10 @@ local function act_check(quiet, finished)               -- finished(ok, problem)
       after_change(); return
     end
     if why and not quiet then say("Not everything could be read: " .. tostring(why)) end
-    local n, c = updates_count(), changed_count()
+    local c = changed_count()
+    local n = updates_count() - c
     if n > 0 then say(n .. " update" .. (n == 1 and "" or "s") .. " available:  pm list updates   (pm update all installs them)") end
-    if c > 0 then say(c .. " plugin" .. (c == 1 and " has" or "s have") .. " changes detected: the file offered is not the one you have, though the version is the same (pm update NAME gets it)") end
+    if c > 0 then say(c .. " plugin" .. (c == 1 and " has" or "s have") .. " changes detected: the file offered is not the one you have, though the version is the same (pm update NAME or pm update all gets them)") end
     if n == 0 and c == 0 and not quiet then say("Everything listed is up to date.") end
     after_change()
   end)
@@ -1573,7 +1574,7 @@ end
 local function window_update_all()
   if busy then say("Wait for the " .. busy .. " to finish."); return end
   local list, outside_n = {}, 0
-  for _, it in ipairs(items) do if it.update then list[#list + 1] = it; if it.src and not it.src.def then outside_n = outside_n + 1 end end end
+  for _, it in ipairs(items) do if it.update or it.changed then list[#list + 1] = it; if it.src and not it.src.def then outside_n = outside_n + 1 end end end
   if #list == 0 then say("No updates are waiting. (Check asks the sources again.)"); return end
   if outside_n > 0 and not confirm("Update " .. #list .. " plugin(s), " .. outside_n .. " of them from repositories you added?\n\nThey run inside MUSHclient: only continue if you trust those sources.") then return end
   run_jobs(list, "update")
@@ -2587,7 +2588,7 @@ function pm_command(name, line, wildcards)
   if #items == 0 then refresh() end
   if cmd == "update" and rest:lower() == "all" then
     local list = {}
-    for _, it in ipairs(items) do if it.update then list[#list + 1] = it end end
+    for _, it in ipairs(items) do if it.update or it.changed then list[#list + 1] = it end end
     if #list == 0 then say("No updates are waiting. (pm check asks the manifest again.)"); return end
     run_jobs(list, "update"); return
   end
