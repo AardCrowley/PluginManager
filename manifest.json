@@ -1,0 +1,218 @@
+{
+ "manifest": 1,
+ "name": "Crowley's plugins",
+ "plugins": [
+  {
+   "id": "28a36788fa20aa062e760ee2",
+   "name": "Aardwolf_Clock",
+   "version": "5.05",
+   "file": "Aardwolf_Clock.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/Aardwolf_Clock%20V2/Aardwolf_Clock.xml",
+   "sha256": "41b93d8e0390d12af44b501581187fb21dd670ca4be575fbece49741fc9d42ee",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Displays a realtime clock based on Aardwolf game time",
+   "author": "Crowley, with help from Fiendish"
+  },
+  {
+   "id": "584807a32cf46af04a1bece3",
+   "name": "Aardwolf_Consider_Window",
+   "version": "2.19",
+   "file": "Aardwolf_Consider_Miniwin.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Mushclient-Consider/c14fa771070b99fe71bb3719a6c907baa28c22e5/Aardwolf_Consider_Miniwin.xml",
+   "sha256": "5a9b4e655f962ffd305f9626c14d4e493bac5f024e7abd1de812a37d2e2d31f0",
+   "repo": "https://github.com/AardCrowley/Mushclient-Consider",
+   "purpose": "Display clickable consider command output.",
+   "author": "Blainer",
+   "extras": [
+    {
+     "file": "Aardwolf_Consider_Miniwin.lua",
+     "url": "https://raw.githubusercontent.com/AardCrowley/Mushclient-Consider/c14fa771070b99fe71bb3719a6c907baa28c22e5/Aardwolf_Consider_Miniwin.lua",
+     "sha256": "ac6f9eadd7d8b331f25625021bd22365cb674dd36a1d94917509aec66242bdf7"
+    },
+    {
+     "file": "Name_Cleanup.lua",
+     "url": "https://raw.githubusercontent.com/AardCrowley/Mushclient-Consider/c14fa771070b99fe71bb3719a6c907baa28c22e5/Name_Cleanup.lua",
+     "sha256": "580b43c9ce691c660da15a3cfe3263053b8ae6379a008301dc002d829ef9ed1c"
+    }
+   ],
+   "dir": "Aardwolf_Consider_Miniwin"
+  },
+  {
+   "id": "381ff501f4f32c86cc30ad4c",
+   "name": "Auction_Utilities",
+   "version": "2.65",
+   "file": "Auction_Utilities.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/Auction_Utilities/Auction_Utilities.xml",
+   "sha256": "acabf21add580f5d9bd37f539b0d697c5d79638e949f3553061ab2875a4426ce",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Auction Helper",
+   "author": "Arcidayne"
+  },
+  {
+   "id": "977138a7afb5ab493795edb7",
+   "name": "Contrast_Picker",
+   "version": "1.0",
+   "file": "Contrast_Picker.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/Contrast_Picker/Contrast_Picker.xml",
+   "sha256": "c10d2c923e8682f14074cf03fefe6a43e0a1e128164b4403b75715bb3c2cd65f",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Checks contrast ratios to pick better contrasting colors.",
+   "author": "Crowley"
+  },
+  {
+   "id": "23baaa250117a5fab975782c",
+   "name": "EqSearch_Window",
+   "version": "1.0",
+   "file": "EqSearch_Window.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/EqSearch_Window/EqSearch_Window.xml",
+   "sha256": "e12f066b9bc89a3723a953e04ec0def98383575c310a28d2f2af7125f8eb0e5a",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Displays EqSearch results in windows",
+   "author": "<aliases>"
+  },
+  {
+   "id": "9e8d9bcaf979d048c65e08a7",
+   "name": "FilterChecker",
+   "version": "1.0",
+   "file": "FilterChecker.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/FilterChecker/FilterChecker.xml",
+   "sha256": "44212085b0d2d8d2437b462b37b678ce6c55cac8bc2c4ec4cf392017c00bd883",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Checks if a message contains a filter word.",
+   "author": "Crowley"
+  },
+  {
+   "id": "d434e9b635dc35c2ff25e1c9",
+   "name": "FriendAgoSorted",
+   "version": "1.0",
+   "file": "FriendAgoSorted.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/FriendAgoSorted/FriendAgoSorted.xml",
+   "sha256": "1ed010fb679812c64209dd7548b1bd55ffda0765ff6173208f9fb7932832c04a",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Sort Friend Ago",
+   "author": "Crowley"
+  },
+  {
+   "id": "e41c7a09d36b4f58a2b07c93",
+   "name": "InventoryWindow",
+   "version": "1.4",
+   "file": "InventoryWindow.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/InventoryWindow/InventoryWindow.xml",
+   "sha256": "516f88712812662e23a84c9aa933d752214b80e8470be29ec7cf34d333182f5f",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Inventory, worn gear and bags in one window",
+   "author": "Crowley"
+  },
+  {
+   "id": "233640c875089ec10c96199d",
+   "name": "Keycheck",
+   "version": "1.0",
+   "file": "Keycheck.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/Keycheck.xml",
+   "sha256": "6a0a737c45b0f294b2307245c3daf60e77cd8692d4336dd22984b13d21813f41",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Displays expiring keys",
+   "author": "Crowley"
+  },
+  {
+   "id": "291e6a78b7457b70ebf24375",
+   "name": "Note_Write_Helper",
+   "version": "2.0",
+   "file": "Note_Write_Helper.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/Note_Write_Helper/Note_Write_Helper.xml",
+   "sha256": "2c32435a5d2061e1472fe3d2239382ac5df7ab7ee341fc914fc93b57a0e5762f",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Preformats long lines to break at 79 characters with respect to full words.",
+   "author": "Arcidayne"
+  },
+  {
+   "id": "c49e43d9dce931263263088b",
+   "name": "NoteExtender",
+   "version": "1.0",
+   "file": "NoteExtender.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/NoteExtender/NoteExtender.xml",
+   "sha256": "a232e5fa30332b8b06cb3b4035dd98a41ae2c3a02d98d372cb11e432bad26278",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Note output and hyperlinks",
+   "author": "Crowley"
+  },
+  {
+   "id": "51e6d559f53be43ae8f93574",
+   "name": "PlayerInfoWindow",
+   "version": "1.9",
+   "file": "PlayerInfoWindow.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/PlayerInfoWindow/PlayerInfoWindow.xml",
+   "sha256": "b709bc1193677733a3148403ad8c236e7d58ff2e77ce50047bf3522b2b48c5f2",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Sends player info to window",
+   "author": "Crowley"
+  },
+  {
+   "id": "8a7ff1c8cf6e889324b26e7e",
+   "name": "RnameWithGMCP",
+   "version": "1.1",
+   "file": "RNameToGMCP.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/RNameToGMCP.xml",
+   "sha256": "01906116cf0ff7918b1ec2719553348c25c0b7280cdcda3c861f72eee9c89dc8",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Displays GMCP room ID and area keyword",
+   "author": "Crowley"
+  },
+  {
+   "id": "456ef9dc8cbbde2bfb90f5a6",
+   "name": "RoomWindow",
+   "version": "1.0",
+   "file": "RoomWindow.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/RoomWindow.xml",
+   "sha256": "a6d078c762807705ecab3579cee84e1e39c5ae9cb2d1afa2dfc13bf8083001b6",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Room items output",
+   "author": "Crowley"
+  },
+  {
+   "id": "a2af6939b450ceecec3d30e6",
+   "name": "ScanMobs",
+   "version": "1.0",
+   "file": "ScanMobs.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/ScanMobs/ScanMobs.xml",
+   "sha256": "403ad3146027f45ba22c29058468f442c18e7907d85513038ba5e6c3e90abb12",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Scan only for certain mobs.",
+   "author": "Crowley"
+  },
+  {
+   "id": "30000000537461726c696e67",
+   "name": "Search_and_Destroy",
+   "version": "6.0",
+   "file": "Search_and_Destroy.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Search-and-Destroy-Revamp/e835cb8fea3a9ea85bc76634b02799e063b25239/Search_and_Destroy.xml",
+   "sha256": "99cb0a2415bbb099a93b901c4ff71a6a24765509710c5dbfe18c447d75d9e2cb",
+   "repo": "https://github.com/AardCrowley/Search-and-Destroy-Revamp",
+   "purpose": "Safe, legal Search and Destroy",
+   "author": "Crowley"
+  },
+  {
+   "id": "8df191366dbc56f8e3ec6c1c",
+   "name": "SlotStats",
+   "version": "1.0",
+   "file": "SlotStats.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/SlotStats/SlotStats.xml",
+   "sha256": "775317a9852d025d76d315a5d7274c06ef07d492a4e760e0dbde5155c8e49414",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Displays stats for playing Slots",
+   "author": "Crowley"
+  },
+  {
+   "id": "2d410b28a4ae912f46f8e75e",
+   "name": "Themed_Tracker",
+   "version": "1.1",
+   "file": "Themed_Tracker.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Aardwolf-Scripts/81bfc53b8c8c82fd589c332e77078c04b84d2326/Themed_Tracker/Themed_Tracker.xml",
+   "sha256": "346106d00ca487d6189dcd2b129f2543192239bd5329a0a075cb5815d775d3ec",
+   "repo": "https://github.com/AardCrowley/Aardwolf-Scripts",
+   "purpose": "Customizable quest tracker",
+   "author": "Arcidayne"
+  }
+ ],
+ "outside": []
+}
