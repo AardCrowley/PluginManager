@@ -10,7 +10,7 @@
    save_state="y"
    date_written="2026-11-14 12:00:00"
    requires="5.07"
-   version="3.2"
+   version="3.3"
    sequence="-50"
    >
 <description trim="y">
@@ -409,8 +409,9 @@ end
 local ORDER = { mine = 1, stock = 2, other = 3, store = 4, outside = 5 }
 local function group_of(it)
   if it.src and it.src.def then return "mine" end
-  if it.src then return it.loaded and "other" or "store" end         -- offered by a repository the player added: never labeled Crowley or Stock
   local file = (it.file or ""):lower()
+  if it.loaded and STOCK[basename(file)] then return "stock" end     -- a stock plugin stays Stock even when a repository lists a file of the same name
+  if it.src then return it.loaded and "other" or "store" end         -- offered by a repository the player added: never labeled Crowley
   if STOCK[basename(file)] then return "stock" end
   if it.loaded and (it.author or ""):lower() == OWNER:lower() then return "mine" end
   if it.src then return it.loaded and "other" or "store" end
