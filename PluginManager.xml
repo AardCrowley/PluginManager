@@ -9,8 +9,8 @@
    purpose="Install, update, reload, enable, disable and remove plugins from one place"
    save_state="y"
    date_written="2026-11-14 12:00:00"
-   requires="5.07"
-   version="3.3"
+   requires="4.90"
+   version="3.4"
    sequence="-50"
    >
 <description trim="y">
@@ -2033,6 +2033,12 @@ end
 function pm_redraw() if TW and WindowInfo(WIN, 1) then safeDraw() end end
 redraw_window = function() if TW and WindowInfo(WIN, 1) then safeDraw() end end
 
+function H.menu(win, text, fn)                 -- add a right-click menu entry; a themed_miniwindows version without these tables just gets no extra entries
+  if type(win.menu_table) == "table" and type(win.menu_handlers) == "table" then
+    table.insert(win.menu_table, text); table.insert(win.menu_handlers, fn)
+  end
+end
+
 local function ensureWindow()
   if not ok_theme then say("The themed window library is not available; use the text commands (pm help)."); return false end
   if TW and WindowInfo(WIN, 1) then return true end
@@ -2040,12 +2046,12 @@ local function ensureWindow()
   TW = ThemedBasicWindow(WIN, 200, 140, 680, 400, "Plugins", "center", true, 1,
     function() safeDraw() end, function() safeDraw(); DoAfterSpecial(0.1, "pm_redraw()", 12) end, function() TW = nil; added = {}; if sb then pcall(sb.unInit, sb) end; sb = nil; if not closing then SetVariable("visible", "0") end end,
     fontName, fontHeight, true)
-  table.insert(TW.menu_table, "Check for updates"); table.insert(TW.menu_handlers, function() H.check_here() end)
-  table.insert(TW.menu_table, "Update everything that has an update"); table.insert(TW.menu_handlers, function() window_update_all() end)
-  table.insert(TW.menu_table, "Add a plugin file..."); table.insert(TW.menu_handlers, function() Execute("pm add") end)
-  table.insert(TW.menu_table, "Font..."); table.insert(TW.menu_handlers, function() Execute("pm font pick") end)
-  table.insert(TW.menu_table, "Save the world file"); table.insert(TW.menu_handlers, function() Execute("pm save") end)
-  table.insert(TW.menu_table, "Close"); table.insert(TW.menu_handlers, function() TW:hide(); SetVariable("visible", "0") end)
+  H.menu(TW, "Check for updates", function() H.check_here() end)
+  H.menu(TW, "Update everything that has an update", function() window_update_all() end)
+  H.menu(TW, "Add a plugin file...", function() Execute("pm add") end)
+  H.menu(TW, "Font...", function() Execute("pm font pick") end)
+  H.menu(TW, "Save the world file", function() Execute("pm save") end)
+  H.menu(TW, "Close", function() TW:hide(); SetVariable("visible", "0") end)
   setupFonts()
   return true
 end
@@ -2402,8 +2408,8 @@ open_listing_window = function(it, kind)
       function() lw_safedraw() end, function() lw_safedraw(); DoAfterSpecial(0.1, "pm_lw_redraw()", 12) end,
       function() LW = nil; lw.wide = false; lw_added = {}; if lw_sb then pcall(lw_sb.unInit, lw_sb) end; lw_sb = nil end,
       fontName, fontHeight, true)
-    table.insert(LW.menu_table, "Font..."); table.insert(LW.menu_handlers, function() Execute("pm font pick") end)
-    table.insert(LW.menu_table, "Close"); table.insert(LW.menu_handlers, function() LW:hide() end)
+    H.menu(LW, "Font...", function() Execute("pm font pick") end)
+    H.menu(LW, "Close", function() LW:hide() end)
   end
   lw_set_side(false)
   lw.it, lw.kind, lw.top, lw.sel = it, kind, 0, nil
@@ -2597,7 +2603,7 @@ open_owner_window = function(owner, repos, partial, mode)
       function() ow_safedraw() end, function() ow_safedraw(); DoAfterSpecial(0.1, "pm_ow_redraw()", 12) end,
       function() OW = nil; ow_added = {}; if ow_sb then pcall(ow_sb.unInit, ow_sb) end; ow_sb = nil end,
       fontName, fontHeight, true)
-    table.insert(OW.menu_table, "Close"); table.insert(OW.menu_handlers, function() OW:hide() end)
+    H.menu(OW, "Close", function() OW:hide() end)
   end
   ow.owner, ow.repos, ow.top, ow.status, ow.mode = owner, repos, 0, partial and ("Note: " .. partial) or "", mode or "add"
   OW:show(); ow_safedraw()
