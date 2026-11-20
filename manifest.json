@@ -148,6 +148,17 @@
    "author": "Crowley"
   },
   {
+   "id": "11c5afa4971179c017400c76",
+   "name": "Plugin_Debugger",
+   "version": "0.92",
+   "file": "Plugin_Debugger.xml",
+   "url": "https://raw.githubusercontent.com/AardCrowley/Plugin_Debugger/b3d869a28626f2aaca134b58173806cad646e479/Plugin_Debugger.xml",
+   "sha256": "807a5d888d06c64c665e5c111185cc117bb02db3512466e216135b9b4d5384ef",
+   "repo": "https://github.com/AardCrowley/Plugin_Debugger",
+   "purpose": "A cleaner Trace: what fires, who called it, and what line led to a command being sent",
+   "author": "Crowley"
+  },
+  {
    "id": "8a7ff1c8cf6e889324b26e7e",
    "name": "RnameWithGMCP",
    "version": "1.1",
