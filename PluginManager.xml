@@ -10,7 +10,7 @@
    save_state="y"
    date_written="2026-11-14 12:00:00"
    requires="4.90"
-   version="3.4"
+   version="3.5"
    sequence="-50"
    >
 <description trim="y">
@@ -606,19 +606,31 @@ local function reload_self(id)
   Execute(prefix .. "DoAfterSpecial(0.1, \"ReloadPlugin('" .. H.rid(id) .. "')\", sendto.script)")
 end
 
--- reload a plugin; a plugin that was disabled stays disabled (a reloaded plugin starts enabled)
+-- reinstall a plugin from its file on disk: unload it, load it again (the way an install does), check it is there. Used by Reload and after an update.
+-- A plugin that was disabled stays disabled (a freshly loaded plugin starts enabled). Nothing is backed up: the file is not changed.
 local function reload_keeping_state(it)
-  local was = it.enabled
-  local rc = ReloadPlugin(H.rid(it.id))
-  if rc == 0 and was == false then EnablePlugin(H.rid(it.id), false) end
+  local id = H.rid(it.id)
+  local was = GetPluginInfo(id, 17)                                  -- asked now: it may have been switched since the list was made
+  if was == nil then was = it.enabled end
+  local rc
+  if it.file and it.file ~= "" then
+    rc = UnloadPlugin(id)
+    if rc == 0 then rc = LoadPlugin(it.file) end
+  else
+    rc = ReloadPlugin(id)
+  end
+  if rc == 0 and not H.is_installed(it.id) then rc = -1 end
+  if rc == 0 and was == false then EnablePlugin(id, false) end
   return rc
 end
 
-local function act_reload(it)
+local function act_reload(it, note)
   if not it.loaded then say(it.name .. " is not loaded."); return end
   if it.self then say("Reloading the manager..."); reload_self(it.id); return end
   local rc = reload_keeping_state(it)
-  if rc ~= 0 then say("Could not reload " .. it.name .. ": " .. rc_text(rc)) else say("Reloaded " .. it.name .. ".") end
+  if rc == -1 then say(it.name .. " did not load again from " .. tostring(it.file) .. ": it is not loaded now (the file may have an error; the Trace or the world's error output shows it).")
+  elseif rc ~= 0 then say("Could not reinstall " .. it.name .. ": " .. rc_text(rc) .. ". If it is unloaded now, the file is " .. tostring(it.file) .. ".")
+  else say("Reinstalled " .. it.name .. " from " .. basename(it.file or "its file") .. (note or ".")) end
   after_change()
 end
 
@@ -2077,7 +2089,10 @@ local function do_action(act, it)
   elseif act == "enable" then act_enable(it, true)
   elseif act == "disable" then act_enable(it, false)
   elseif act == "update" or act == "install" then
-    if not it.m then say(it.name .. " is not in the manifest."); return end
+    if not it.m then
+      if it.loaded then act_reload(it, " (no repository or manifest offers it, so there was nothing to download or back up).") else say(it.name .. " is not in the manifest.") end
+      return
+    end
     if not confirm_outside(act, it) then return end
     run_jobs({ it }, act)
   elseif act == "remove" then
@@ -2771,7 +2786,11 @@ function pm_command(name, line, wildcards)
   elseif cmd == "aliases" or cmd == "alias" then act_listing(it, "alias")
   elseif cmd == "triggers" or cmd == "trigger" then act_listing(it, "trigger")
   elseif cmd == "update" or cmd == "install" then
-    if not it.m then say(it.name .. " is not in the manifest. (pm check reads it; outside packages are links only: pm open)"); return end
+    if not it.m then
+      if cmd == "update" and it.loaded then act_reload(it, " (no repository or manifest offers it, so there was nothing to download or back up).")
+      else say(it.name .. " is not in the manifest. (pm check reads it; outside packages are links only: pm open)") end
+      return
+    end
     if cmd == "update" and not it.loaded then say(it.name .. " is not loaded: use  pm install  instead."); return end
     if cmd == "install" and it.loaded then say(it.name .. " is already loaded: use  pm update  to get a newer version."); return end
     if cmd == "update" and not it.update and not it.changed then say(it.name .. " is already up to date (v" .. tostring(it.ver) .. ")."); return end
@@ -2802,10 +2821,6 @@ end
 function pm_show_window() toggle_window(true) end
 function OnPluginListChanged() refresh(); redraw_window() end
 function OnPluginClose() closing = true; if TW then pcall(function() TW:hide() end) end; if LW then pcall(function() LW:hide() end) end; if OW then pcall(function() OW:hide() end) end end
-
--- for the tests
-PmTest = { items = function() return items end, shown = function() return shown end, listed = function() return listed end, manifest = main_data, sources = function() return sources end, view = view, draw = draw, find = find, sel_sources = H.sel_sources, safe_name = safe_name,
-           parse = parse_manifest, refresh = refresh, owner = owner_of, forget_cache = function() cache = nil end, standard = H.is_standard_file, relok = H.rel_ok, kind = function(u) return kind_of(normalize_source(u)) end }
 ]]>
 </script>
 </muclient>
